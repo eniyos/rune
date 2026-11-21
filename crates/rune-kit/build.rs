@@ -78,6 +78,7 @@ fn extract_const<'a>(src: &'a str, name: &str) -> &'a str {
     &rest[..end]
 }
 
+#[allow(clippy::disallowed_methods)]
 fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_MATH");
     if std::env::var_os("CARGO_FEATURE_MATH").is_none() {

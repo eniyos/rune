@@ -59,7 +59,7 @@ mod tests;
 use std::future::ready;
 use std::pin::Pin;
 
-use objc2_metal::{MTLCopyAllDevices, MTLDevice};
+use objc2_metal::{MTLCopyAllDevices, MTLCreateSystemDefaultDevice, MTLDevice};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use wgpu::custom::*;
@@ -173,7 +173,16 @@ impl InstanceInterface for MetalInstance {
         Ok(unsafe { surface::create(target) })
     }
     fn request_adapter(&self, options: &wgpu::RequestAdapterOptions<'_, '_>) -> Pin<Box<dyn RequestAdapterFuture>> {
-        let device = preferred(devices(), options.power_preference).expect("Rune's Metal backend needs a Metal device");
+        let Some(device) = preferred(devices(), options.power_preference) else {
+            return Box::pin(ready(Err(wgpu::RequestAdapterError::NotFound {
+                active_backends: wgpu::Backends::all(),
+                requested_backends: wgpu::Backends::all(),
+                supported_backends: wgpu::Backends::all(),
+                no_fallback_backends: wgpu::Backends::empty(),
+                no_adapter_backends: wgpu::Backends::all(),
+                incompatible_surface_backends: wgpu::Backends::empty(),
+            })));
+        };
         Box::pin(ready(Ok(DispatchAdapter::custom(MetalAdapter { device }))))
     }
     fn poll_all_devices(&self, _: bool) -> bool { true }
@@ -189,11 +198,16 @@ struct MetalAdapter {
 }
 send_sync!(MetalAdapter);
 
-/// The Mac's GPUs, as wgpu-hal lists them. Not `MTLCreateSystemDefaultDevice`: to find the main
-/// display's GPU it connects to the window server, which costs a fresh process about 8 ms more
-/// (14 ms instead of 5.5 on an M-series Mac), on every headless run and on a launch's prewarm.
+/// The Mac's GPUs, as wgpu-hal lists them. Falls back to `MTLCreateSystemDefaultDevice`
+/// if `MTLCopyAllDevices` returns none (e.g. in headless runs or secondary contexts).
 fn devices() -> Vec<Obj<dyn MTLDevice>> {
-    MTLCopyAllDevices().to_vec()
+    let mut list = MTLCopyAllDevices().to_vec();
+    if list.is_empty() {
+        if let Some(default) = MTLCreateSystemDefaultDevice() {
+            list.push(default);
+        }
+    }
+    list
 }
 
 /// The first integrated GPU, or for `HighPerformance` the first discrete one, else the first: the

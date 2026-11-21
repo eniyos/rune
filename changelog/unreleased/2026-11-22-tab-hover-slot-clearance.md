@@ -1,0 +1,1 @@
+- Kit: a hovered tab's title clears its full slot clearance (including 44 pt touch status marks) instead of a hardcoded 24 pt, and native Metal adapter resolution returns NotFound on headless environments without a device.
