@@ -295,7 +295,7 @@ fn title(title: &str, editor: Option<El>, at: &Place, vertical: bool, emphasized
     let hovered = hidden(
         row()
             .key("hovered")
-            .pin(Some(0.0), Some(0.0), Some(24.0), Some(0.0))
+            .pin(Some(0.0), Some(0.0), Some(room), Some(0.0))
             .clip_fade_linear(fade_l, 0.0, fade_r, 0.0)
             .group_opacity(0.0, 1.0)
             .child(clipped(label)),
