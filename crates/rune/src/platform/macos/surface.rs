@@ -15,6 +15,41 @@ pub(crate) fn present_with_transaction(surface: &wgpu::Surface, on: bool) {
     crate::gpu::with_layer(surface, |layer| unsafe { let _: () = msg_send![layer, setPresentsWithTransaction: Bool::new(on)]; });
 }
 
+/// A first frame drawn before AppKit has finished launching (the first window is made in
+/// `applicationWillFinishLaunching:`): Core Animation's transaction, which holds the window's
+/// layers and the drawable presented in it, goes to the window server now. The run loop turn
+/// that would commit it comes only after AppKit's own launch work.
+pub(crate) fn flush_while_launching() {
+    if !launching() { return; }
+    // SAFETY: a class method on the main thread.
+    unsafe {
+        if let Some(transaction) = objc2::runtime::AnyClass::get(c"CATransaction") {
+            let _: () = msg_send![transaction, flush];
+            crate::marks::mark("frame.first.flushed");
+        }
+    }
+}
+
+/// Whether AppKit is still launching the app (`applicationDidFinishLaunching:` hasn't come).
+/// Until then it reports nothing of a window made in `applicationWillFinishLaunching:`: not
+/// that it is on screen, and no change of that.
+pub(crate) fn launching() -> bool {
+    use objc2::runtime::{AnyClass, AnyObject, Bool};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LAUNCHED: AtomicBool = AtomicBool::new(false);
+    if LAUNCHED.load(Ordering::Relaxed) { return false; }
+    // SAFETY: a class method and a property read.
+    let launched = unsafe {
+        let Some(running) = AnyClass::get(c"NSRunningApplication") else { return false };
+        let current: *const AnyObject = msg_send![running, currentApplication];
+        if current.is_null() { return false; }
+        let launched: Bool = msg_send![current, isFinishedLaunching];
+        launched.as_bool()
+    };
+    if launched { LAUNCHED.store(true, Ordering::Relaxed); }
+    !launched
+}
+
 #[link(name = "QuartzCore", kind = "framework")]
 unsafe extern "C" {
     static kCAGravityTopLeft: &'static objc2::runtime::AnyObject;
@@ -28,21 +63,57 @@ fn top_left_gravity(contents_flipped: bool) -> &'static objc2::runtime::AnyObjec
     unsafe { if contents_flipped { kCAGravityBottomLeft } else { kCAGravityTopLeft } }
 }
 
-/// Pins the Metal layer's contents to the window's top left at their own size. A drawable that
-/// doesn't match the layer yet (a frame that isn't drawn in time for a resize) is clipped or
-/// leaves a strip, rather than stretched to the new size and snapped back a frame later.
-/// Also tags the contents sRGB, as AppKit's own drawing is, so the compositor colour-matches
-/// them to the display (untagged, a wide-gamut display shows them oversaturated). Either
-/// surface format holds sRGB-encoded values; wgpu's reconfigures keep the tag.
+/// Pins the Metal layer's contents to the window's top left at their own size, disables Core
+/// Animation's implicit animations on its scale and geometry, and tags the contents sRGB.
+///
+/// A drawable that doesn't match the layer yet (a frame that isn't drawn in time for a resize)
+/// is clipped or leaves a strip, rather than stretched to the new size and snapped back a frame
+/// later. Disabling implicit actions through `actions` stops `raw-window-metal`'s KVO updates to
+/// `contentsScale` and `bounds`/`position` on the sublayer from running Core Animation's 0.25 s
+/// ease when a window crosses between displays of different scales, without touching `delegate`
+/// (which `layer_occluded` and wgpu's occlusion check walk to find the hosting `NSView`). Tagging
+/// sRGB matches AppKit's own drawing so wide-gamut displays don't oversaturate the contents;
+/// wgpu's reconfigures keep these layer properties.
 pub(crate) fn pin_contents_top_left(surface: &wgpu::Surface) {
-    use objc2::runtime::Bool;
+    use objc2::runtime::{AnyClass, AnyObject, Bool};
     use objc2_core_graphics::{CGColorSpace, kCGColorSpaceSRGB};
-    // SAFETY: a live CAMetalLayer, on the main thread, under wgpu's lock.
+    use objc2_foundation::{NSDictionary, NSString, ns_string};
+    // SAFETY: `layer` is a live `CAMetalLayer` on the main thread under wgpu's lock;
+    // `+[NSNull null]` returns the process-lifetime `NSNull` singleton.
     crate::gpu::with_layer(surface, |layer| unsafe {
         let flipped: Bool = msg_send![layer, contentsAreFlipped];
         let _: () = msg_send![layer, setContentsGravity: top_left_gravity(flipped.as_bool())];
+        if let Some(null_cls) = AnyClass::get(c"NSNull") {
+            let null: *const AnyObject = msg_send![null_cls, null];
+            if let Some(null) = null.as_ref() {
+                let keys: [&NSString; 5] = [
+                    ns_string!("contentsScale"),
+                    ns_string!("bounds"),
+                    ns_string!("position"),
+                    ns_string!("contents"),
+                    ns_string!("contentsGravity"),
+                ];
+                let actions = NSDictionary::from_slices(&keys, &[null; 5]);
+                let _: () = msg_send![layer, setActions: &*actions];
+            }
+        }
         let Some(srgb) = CGColorSpace::with_name(Some(kCGColorSpaceSRGB)) else { return };
         let _: () = msg_send![layer, setColorspace: &*srgb];
+    });
+}
+
+/// Matches the Metal layer's `contentsScale` to `scale` right away, closing the gap between a
+/// display-crossing `Moved`/`ScaleFactorChanged` surface resize and AppKit updating the backing
+/// view's root layer.
+pub(crate) fn sync_contents_scale(surface: &wgpu::Surface, scale: f32) {
+    let scale = f64::from(scale);
+    if !(scale.is_finite() && scale > 0.0) { return; }
+    // SAFETY: `layer` is a live `CAMetalLayer` on the main thread under wgpu's lock.
+    crate::gpu::with_layer(surface, |layer| unsafe {
+        let current: f64 = msg_send![layer, contentsScale];
+        if (current - scale).abs() > f64::EPSILON {
+            let _: () = msg_send![layer, setContentsScale: scale];
+        }
     });
 }
 

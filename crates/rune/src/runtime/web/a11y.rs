@@ -59,8 +59,9 @@ pub(crate) struct A11yItem {
     /// What describes it beyond its name (`El::description`, `El::described_by`'s words):
     /// `aria-description`.
     pub description: String,
-    /// A control's states, for a button carrying a control's role (`role`): `aria-selected`,
-    /// `aria-checked`, and its place in its set (`El::position_in_set`).
+    /// A control's states: `aria-pressed` on a toggle button, `aria-selected`, `aria-checked`,
+    /// and its place in its set (`El::position_in_set`) on a control role (`role`).
+    pub pressed: Option<&'static str>,
     pub selected: Option<bool>,
     pub checked: Option<&'static str>,
     pub set: Option<(usize, usize)>,
@@ -89,7 +90,7 @@ pub(crate) struct A11yRun {
 impl A11yItem {
     fn new(kind: &'static str, path: &str, rect: [f32; 4]) -> Self {
         A11yItem { kind, path: path.to_owned(), rect, font_size: 0.0, level: None, expanded: None, text: String::new(),
-            runs: Vec::new(), tag: None, role: None, parent: None, id: None, href: None, font: None, selectable: false, description: String::new(), selected: None, checked: None, set: None }
+            runs: Vec::new(), tag: None, role: None, parent: None, id: None, href: None, font: None, selectable: false, description: String::new(), pressed: None, selected: None, checked: None, set: None }
     }
 
     fn to_json(&self) -> Value {
@@ -102,6 +103,7 @@ impl A11yItem {
         if let Some(x) = self.expanded { obj.insert("x".into(), json!(x)); }
         if !self.text.is_empty() { obj.insert("t".into(), json!(self.text)); }
         if !self.description.is_empty() { obj.insert("d".into(), json!(self.description)); }
+        if let Some(pr) = self.pressed { obj.insert("pr".into(), json!(pr)); }
         if let Some(s) = self.selected { obj.insert("se".into(), json!(s)); }
         if let Some(c) = self.checked { obj.insert("c".into(), json!(c)); }
         if let Some((pos, size)) = self.set { obj.insert("n".into(), json!([pos, size])); }
@@ -137,11 +139,24 @@ pub(crate) fn anchor_id(key: Option<&str>) -> Option<String> {
     ok.then(|| key.to_owned())
 }
 
+/// Strips control characters and CSS/HTML syntax characters from a font family name so it
+/// stays inside a CSS double-quoted string and cannot break out of `<style>` or `cssText`.
+pub(crate) fn sanitize_font_family(name: &str) -> String {
+    name.chars()
+        .filter(|&c| !c.is_control() && !matches!(c, '"' | '\'' | '\\' | ';' | '{' | '}' | '<' | '>'))
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
 pub(crate) fn family_name(family: crate::tok::Family) -> String {
     match family {
         crate::tok::Family::Sans => "sans".into(),
         crate::tok::Family::Mono | crate::tok::Family::SystemMono => "mono".into(),
-        crate::tok::Family::Named(name) => name.into(),
+        crate::tok::Family::Named(name) => {
+            let clean = sanitize_font_family(name);
+            if clean.is_empty() { "sans".into() } else { clean }
+        }
     }
 }
 
@@ -163,6 +178,23 @@ pub(crate) fn takes_pointer(n: &Node) -> bool {
         || n.input.is_some() || n.window_drag == crate::el::WindowDrag::Drag
         || n.a11y.more.as_ref().is_some_and(|m| m.href.is_some())
         || roles::takes_pointer(n.role)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckedAttr { Pressed, Checked, Selected }
+
+/// Which ARIA state attribute carries `El::checked` for `aria_role` (`None` is an HTML `<button>`).
+fn checked_attr(aria_role: Option<&str>) -> Option<CheckedAttr> {
+    match aria_role {
+        None | Some("button") => Some(CheckedAttr::Pressed),
+        Some("checkbox" | "radio" | "switch" | "menuitem" | "menuitemcheckbox" | "menuitemradio" | "treeitem") => Some(CheckedAttr::Checked),
+        Some("tab" | "option") => Some(CheckedAttr::Selected),
+        _ => None,
+    }
+}
+
+fn checked_str(c: crate::el::Checked) -> &'static str {
+    match c { crate::el::Checked::True => "true", crate::el::Checked::False => "false", crate::el::Checked::Mixed => "mixed" }
 }
 
 fn round1(v: f32) -> f32 { (v * 10.0).round() / 10.0 }
@@ -191,34 +223,40 @@ fn text_runs(path: &str, spec: &crate::el::TextSpec) -> Vec<A11yRun> {
         let t = clean_slice(spec, 0, spec.content.len());
         return if t.is_empty() { Vec::new() } else { vec![A11yRun { text: t, href: None, path: None, link: None }] };
     }
-    let mut out = Vec::new();
+    let mut out: Vec<A11yRun> = Vec::new();
     let mut at = 0usize;
+    let push_plain = |out: &mut Vec<A11yRun>, text: String| {
+        if text.is_empty() { return; }
+        if let Some(last) = out.last_mut().filter(|r| r.href.is_none()) {
+            last.text.push_str(&text);
+        } else {
+            out.push(A11yRun { text, href: None, path: None, link: None });
+        }
+    };
     for (idx, link) in spec.cold.links.iter().enumerate() {
         let (la, lb) = ((link.start as usize).min(spec.content.len()), (link.end as usize).min(spec.content.len()));
         if la > at {
-            let before = clean_slice(spec, at, la);
-            if !before.is_empty() {
-                out.push(A11yRun { text: before, href: None, path: None, link: None });
-            }
+            push_plain(&mut out, clean_slice(spec, at, la));
         }
         if lb > la {
             let label = clean_slice(spec, la, lb);
             if !label.is_empty() {
-                out.push(A11yRun {
-                    text: label,
-                    href: Some(link.id.clone()),
-                    path: Some(path.to_owned()),
-                    link: Some(idx),
-                });
+                if let Ok(href) = crate::open_url::check_href(&link.id) {
+                    out.push(A11yRun {
+                        text: label,
+                        href: Some(href),
+                        path: Some(path.to_owned()),
+                        link: Some(idx),
+                    });
+                } else {
+                    push_plain(&mut out, label);
+                }
             }
         }
         at = at.max(lb);
     }
     if at < spec.content.len() {
-        let tail = clean_slice(spec, at, spec.content.len());
-        if !tail.is_empty() {
-            out.push(A11yRun { text: tail, href: None, path: None, link: None });
-        }
+        push_plain(&mut out, clean_slice(spec, at, spec.content.len()));
     }
     out
 }
@@ -290,16 +328,29 @@ impl RuntimeCore {
 
     pub(crate) fn descendant_label(&self, root: usize, end: usize) -> String {
         let mut parts = Vec::new();
-        for j in root..end {
-            if !self.allowed(j) || self.subtree_exiting(j) || self.tree.nodes[j].vis.opacity <= 0.01 { continue; }
-            if let Some(lbl) = self.tree.nodes[j].label.as_deref().filter(|s| !s.trim().is_empty()) {
-                parts.push(lbl.trim().to_owned());
+        let mut j = root;
+        while j < end {
+            let n = &self.tree.nodes[j];
+            if n.is_secure() {
+                j = self.subtree_end(j).min(end);
                 continue;
             }
-            if let Some(spec) = self.tree.nodes[j].text.as_deref().filter(|t| !t.redacted && self.tree.nodes[j].input.is_none()) {
+            if !self.allowed(j) || self.subtree_exiting(j) || n.vis.opacity <= 0.01
+                || (j > root && (n.a11y.hidden || n.handlers.on_press.is_some() || n.role == "button"))
+            {
+                j = if j > root { self.subtree_end(j).min(end) } else { j + 1 };
+                continue;
+            }
+            if let Some(lbl) = n.label.as_deref().filter(|s| !s.trim().is_empty()) {
+                parts.push(lbl.trim().to_owned());
+                j += 1;
+                continue;
+            }
+            if let Some(spec) = n.text.as_deref().filter(|t| !t.redacted && n.input.is_none()) {
                 let s = clean_slice(spec, 0, spec.content.len());
                 if !s.trim().is_empty() { parts.push(s.trim().to_owned()); }
             }
+            j += 1;
         }
         parts.join(" ")
     }
@@ -333,6 +384,9 @@ impl RuntimeCore {
         // Open horizontal scrollers and how far the browser has scrolled each, so their content
         // mirrors where it sits inside them rather than where the scroll puts it.
         let mut scrollers: Vec<(usize, f64)> = Vec::new();
+        // End of an emitted control whose subtree is walked for nested interactive descendants, so
+        // its own non-interactive content isn't duplicated beside the control.
+        let mut control_end: usize = 0;
         let mut i = 0;
         while i < self.tree.nodes.len() {
             while open.last().is_some_and(|&(end, _)| i >= end) { open.pop(); }
@@ -354,7 +408,7 @@ impl RuntimeCore {
                 last_flow_parent = None;
                 continue;
             }
-            if n.input.is_some() {
+            if n.input.is_some() || n.is_secure() {
                 i = end;
                 last_flow_parent = None;
                 continue;
@@ -381,10 +435,11 @@ impl RuntimeCore {
                 out.push(item);
             };
 
+            let in_control = i < control_end;
             // A labelled `group` (a game's surface naming its keys, a set of controls) is a div
             // with the role and its label; an unlabelled one adds nothing a reader would say.
             let labelled_group = n.role == "group" && self.mirror_name(i).is_some();
-            if let Some(tag) = roles::container_tag(n.role).or(labelled_group.then_some("div")) {
+            if !in_control && let Some(tag) = roles::container_tag(n.role).or(labelled_group.then_some("div")) {
                 let mut item = A11yItem::new("group", &n.path, rect);
                 item.tag = Some(tag);
                 item.role = roles::container_aria(n.role).or(labelled_group.then_some("group"));
@@ -397,7 +452,8 @@ impl RuntimeCore {
                 i += 1;
                 continue;
             }
-            if let Some(href) = n.a11y.more.as_ref().and_then(|m| m.href.clone()) {
+            let raw_href = n.a11y.more.as_ref().and_then(|m| m.href.as_deref());
+            if let Some(href) = raw_href.and_then(|u| crate::open_url::check_href(u).ok()) {
                 let label = self.mirror_name(i).unwrap_or_else(|| self.descendant_label(i, end));
                 if !label.is_empty() && rect[2] > 0.0 && rect[3] > 0.0 {
                     let mut item = A11yItem::new("link", &n.path, rect);
@@ -410,7 +466,7 @@ impl RuntimeCore {
                 last_flow_parent = None;
                 continue;
             }
-            if matches!(n.role, "image" | "img") && let Some(label) = self.mirror_name(i) {
+            if !in_control && matches!(n.role, "image" | "img") && let Some(label) = self.mirror_name(i) {
                 let mut item = A11yItem::new("image", &n.path, rect);
                 item.text = label;
                 push(&mut out, item);
@@ -418,31 +474,48 @@ impl RuntimeCore {
                 last_flow_parent = None;
                 continue;
             }
-            let button_like = (n.role == "button" || n.handlers.on_press.is_some()) && n.window_drag != crate::el::WindowDrag::Drag;
+            let button_like = raw_href.is_none()
+                && (n.role == "button" || n.handlers.on_press.is_some())
+                && n.window_drag != crate::el::WindowDrag::Drag;
             // Only collapse a pressable container into one button when it doesn't wrap an entire
-            // multi-block section with independent buttons inside.
+            // multi-block section with independent buttons inside, unless it has an explicit
+            // control role (such as a closable tab, whose close button mirrors as a sibling).
             let nested_press = (i + 1..end).any(|j| self.tree.nodes[j].handlers.on_press.is_some() || self.tree.nodes[j].role == "button");
-            if button_like && !nested_press && rect[2] > 0.0 && rect[3] > 0.0 {
+            let control_role = roles::web_control_role(n.role);
+            if button_like && (!nested_press || control_role.is_some()) && rect[2] > 0.0 && rect[3] > 0.0 {
                 let label = self.mirror_name(i).unwrap_or_else(|| self.descendant_label(i, end));
                 if !label.is_empty() {
                     let mut item = A11yItem::new("button", &n.path, rect);
                     item.expanded = n.a11y.expanded;
                     item.text = label;
                     item.description = self.mirror_description(i);
-                    if let Some(role) = roles::web_control_role(n.role) {
+                    if let Some(role) = control_role {
                         item.role = Some(role);
                         if self.a11y_role(i).is_some_and(roles::selectable_item) { item.selected = Some(n.focus.selected); }
-                        item.checked = n.a11y.checked.map(|c| match c { crate::el::Checked::True => "true", crate::el::Checked::False => "false", crate::el::Checked::Mixed => "mixed" })
-                            .or_else(|| (n.role == "radio").then_some(if n.focus.selected { "true" } else { "false" }));
                         item.set = n.a11y.more.as_ref().and_then(|m| m.set);
                     }
+                    let checked = n.a11y.checked
+                        .or_else(|| (n.role == "radio").then_some(if n.focus.selected { crate::el::Checked::True } else { crate::el::Checked::False }));
+                    if let Some(c) = checked {
+                        match checked_attr(item.role) {
+                            Some(CheckedAttr::Pressed) => item.pressed = Some(checked_str(c)),
+                            Some(CheckedAttr::Checked) => item.checked = Some(checked_str(c)),
+                            Some(CheckedAttr::Selected) => item.selected = Some(c == crate::el::Checked::True),
+                            None => {}
+                        }
+                    }
                     push(&mut out, item);
-                    i = end;
+                    if nested_press {
+                        control_end = control_end.max(end);
+                        i += 1;
+                    } else {
+                        i = end;
+                    }
                     last_flow_parent = None;
                     continue;
                 }
             }
-            if let Some(spec) = n.text.as_deref().filter(|t| !t.redacted && rect[2] > 0.0 && rect[3] > 0.0) {
+            if !in_control && let Some(spec) = n.text.as_deref().filter(|t| !t.redacted && rect[2] > 0.0 && rect[3] > 0.0) {
                 let runs = text_runs(&n.path, spec);
                 let selectable = spec.selectable || selects.get(i).copied().unwrap_or(false);
                 if !runs.is_empty() {
@@ -517,7 +590,7 @@ impl RuntimeCore {
                         selectable,
                     });
                 }
-            } else if n.role == "heading" && let Some(lbl) = self.mirror_name(i) {
+            } else if !in_control && n.role == "heading" && let Some(lbl) = self.mirror_name(i) {
                 let mut item = A11yItem::new("heading", &n.path, rect);
                 item.font_size = 16.0;
                 item.level = Some(n.a11y.level.unwrap_or(2).clamp(1, 6));
@@ -619,17 +692,24 @@ impl RuntimeCore {
     fn web_focus_item(&self, i: usize) -> Value {
         let n = &self.tree.nodes[i];
         let role = self.a11y_role(i);
+        let focus_role = role.map_or("group", roles::focus_role);
         let mut o = serde_json::Map::new();
-        o.insert("o".into(), json!(role.map_or("group", roles::focus_role)));
+        o.insert("o".into(), json!(focus_role));
         let name = self.mirror_name(i).unwrap_or_else(|| self.descendant_label(i, self.subtree_end(i)));
         o.insert("t".into(), json!(name));
         let description = self.mirror_description(i);
         if !description.is_empty() { o.insert("d".into(), json!(description)); }
+        let mut selected = role.is_some_and(roles::selectable_item).then_some(n.focus.selected);
         let checked = n.a11y.checked.or_else(|| (role == Some(accesskit::Role::RadioButton)).then_some(if n.focus.selected { crate::el::Checked::True } else { crate::el::Checked::False }));
         if let Some(c) = checked {
-            o.insert("c".into(), json!(match c { crate::el::Checked::True => "true", crate::el::Checked::False => "false", crate::el::Checked::Mixed => "mixed" }));
+            match checked_attr(Some(focus_role)) {
+                Some(CheckedAttr::Pressed) => { o.insert("pr".into(), json!(checked_str(c))); }
+                Some(CheckedAttr::Checked) => { o.insert("c".into(), json!(checked_str(c))); }
+                Some(CheckedAttr::Selected) => { selected = Some(c == crate::el::Checked::True); }
+                None => {}
+            }
         }
-        if role.is_some_and(roles::selectable_item) { o.insert("s".into(), json!(n.focus.selected)); }
+        if let Some(s) = selected { o.insert("s".into(), json!(s)); }
         if let Some(open) = n.a11y.expanded { o.insert("x".into(), json!(open)); }
         if let Some((pos, size)) = n.a11y.more.as_ref().and_then(|m| m.set) { o.insert("n".into(), json!([pos, size])); }
         if let Some(level) = n.a11y.level { o.insert("l".into(), json!(level)); }

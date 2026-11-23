@@ -288,7 +288,7 @@ impl<S: 'static> App<S> {
     /// where the system says so) and come back, with whether it shows now, as a web page's
     /// `visibilitychange` hears `document.hidden` change: for work that should wait while no
     /// one can see it, such as a notification's timer. Called once per change after the first
-    /// frame. Native windows only.
+    /// frame; a poll reads the same with [`Tx::window_visible`].
     pub fn on_visibility(mut self, f: fn(&mut S, bool, &mut Tx)) -> Self {
         self.runtime.on_visibility = Some(f);
         self
@@ -514,7 +514,8 @@ impl<S: 'static> App<S> {
     /// hidden, after GPU completion of its cached surface frame. A window that isn't on screen
     /// (covered, occluded, hidden or on another Space) doesn't wait to draw: this runs at its
     /// first frame skipped for that, or a second after it opens with no frame at all.
-    /// Not called by headless tooling. May queue a show through the supplied handle.
+    /// Headless tooling skips this unless `--realtime` is passed, which runs it after
+    /// the first frame. May queue a show through the supplied handle.
     pub fn on_ready(mut self, f: impl FnMut(&crate::WindowHandle) + 'static) -> Self {
         self.on_ready = Some(Box::new(f));
         self

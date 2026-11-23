@@ -150,7 +150,10 @@ pub(in crate::runtime) fn inh_key(p: &Inh) -> u64 {
     bits(&mut h, &[p.still.0]);
     bits(&mut h, &p.still.1);
     bits(&mut h, &p.still.2);
-    (p.in_cache, p.skip_paint, p.turn).hash(&mut h);
+    bits(&mut h, &[p.held.0]);
+    bits(&mut h, &p.held.1);
+    bits(&mut h, &p.held.2);
+    (p.held_moving, p.in_cache, p.skip_paint, p.anchor_hidden, p.turn).hash(&mut h);
     p.snap.hash_bits(&mut h);
     h.finish()
 }
@@ -202,7 +205,7 @@ impl RuntimeCore {
         self.paint.keep.painted = self.paint.keep.frame;
         // Paint goes depth first, siblings in paint order (`update_layer_paint_order`), so a subtree
         // paints in one run unless it holds a node lifted out to paint last.
-        let lifted = !self.motion.flying.is_empty() || self.tree.has_raise;
+        let lifted = !self.motion.flying.is_empty() || self.tree.has_raise || self.paint.has_lifted_anchors();
         let shareable = !lifted && self.motion.flights().is_empty() && self.paint.paint_rank.is_none()
             && self.kbd.modal_scope.is_none() && !self.commit.defaults.force_focus_rings && !disabled();
         let key = shareable.then(|| {
@@ -582,7 +585,8 @@ fn static_ok(n: &Node) -> bool {
         && n.vis.backdrop_blur <= 0.0 && n.vis.effect.is_none() && n.vis.pixels.is_none()
         && n.sticky.is_none() && n.above.is_none() && n.matched.is_none()
         && n.static_scale == 1.0 && !n.scale_track && n.vis.mark == 0
-        && n.text.as_ref().is_none_or(|t| t.cold.links.is_empty() && t.cold.live.is_none() && t.cold.advance_in.is_none())
+        && n.text.as_ref().is_none_or(|t| t.cold.links.is_empty() && t.cold.live.is_none() && t.cold.advance_in.is_none()
+            && !t.cold.pills.iter().any(|p| p.bare.as_ref().is_some_and(|b| b.image.is_some())))
 }
 
 /// What the runtime holds for a node besides it: selection, marks, reveals, loops, scales

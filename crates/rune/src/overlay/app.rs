@@ -234,6 +234,7 @@ fn build_parts<S, T: 'static>(
     let text = TextSystem::for_window(app.fonts, app.families);
     let mut rt = Runtime::with_text(state, spec.view, spec.size, Env::default(), text);
     rt.configure(runtime);
+    rt.track_marks = compositor.is_some();
     rt.on_key = on_key;
     // App and overlay may use different state types. Downcast the function pointer
     // once, without a per-frame adapter or changing App::overlay's generic API.
@@ -376,6 +377,7 @@ impl<T: 'static> Overlay<T> {
     pub(super) fn advance_at(&mut self, now: Instant) { with_app!(self, |core, app| core.advance_at(&mut app, now)) }
     pub(super) fn wake_due(&mut self, now: Instant) { with_app!(self, |core, app| core.wake_due(&mut app, now)) }
     pub(super) fn hide(&mut self) { with_app!(self, |core, app| core.hide(&mut app)) }
+    pub(super) fn drop_hidden_images(&mut self) { with_app!(self, |core, app| core.drop_hidden_images(&mut app)) }
     pub(super) fn hide_fading(&mut self, fade: Duration) { with_app!(self, |core, app| core.hide_fading(&mut app, fade)) }
     pub(super) fn presence_due(&mut self, now: Instant) { with_app!(self, |core, app| core.presence_due(&mut app, now)) }
     pub(super) fn accent_changed(&mut self, accent: crate::SystemAccent) { self.core.accent_changed(self.rt.core_mut(), accent) }
@@ -392,6 +394,8 @@ impl<T: 'static> Overlay<T> {
     pub(super) fn left_button(&mut self, pressed: bool, point: Option<(f32, f32)>) { with_app!(self, |core, app| core.left_button(&mut app, pressed, point)) }
     pub(super) fn drag_ends_due(&mut self) { with_app!(self, |core, app| core.drag_ends_due(&mut app)) }
     pub(super) fn missed(&mut self, missed: crate::window::Missed, paced: bool, stepped: bool) { with_app!(self, |core, app| core.missed(&mut app, missed, paced, stepped)) }
+    #[cfg(test)]
+    pub(super) fn missed_at(&mut self, missed: crate::window::Missed, paced: bool, stepped: bool, now: Instant) { with_app!(self, |core, app| core.missed_at(&mut app, missed, paced, stepped, now)) }
     pub(super) fn acquire_missed(&mut self, missed: crate::window::Missed, paced: bool, prewarm: bool, built: bool) {
         with_app!(self, |core, app| core.acquire_missed(&mut app, missed, paced, prewarm, built))
     }
@@ -448,3 +452,7 @@ impl<T: 'static> Overlay<T> {
         with_app!(self, |core, app| core.observe_pointer(&mut app, x, y))
     }
 }
+
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod tests;

@@ -43,7 +43,7 @@ impl CommitState {
             return false;
         }
         if !tree.nodes.iter().all(|n| {
-            relayout::reusable(n) && n.text.as_ref().is_none_or(|t| !t.redacted && t.cold.live.is_none())
+            relayout::reusable(n) && n.text.as_ref().is_none_or(|t| !t.redacted)
         }) {
             return false;
         }
@@ -53,7 +53,7 @@ impl CommitState {
             }
             let Some(&list_id) = tree.path_ids.get(path) else { return false };
             let Some(&list_idx) = tree.node_index.get(&list_id) else { return false };
-            if !tree.nodes.get(list_idx).is_some_and(|n| n.id == list_id && n.path == *path && n.growth.is_some()) {
+            if !tree.nodes.get(list_idx).is_some_and(|n| n.id == list_id && n.path == *path && n.virtual_list && n.growth.is_some()) {
                 return false;
             }
             let Some(&scroll_id) = tree.path_ids.get(&v.scroll_path) else { return false };
@@ -186,12 +186,12 @@ impl Measurement<'_> {
             let delta = v.anchor_delta();
             offset = (offset + delta).max(0.0);
             if let Some(st) = self.scrolls.get_mut(&scroll_id) && !held {
-                st.offset = (st.offset + f64::from(delta)).max(0.0);
+                st.shift_anchor(delta);
             }
             let shown = std::mem::take(&mut v.shown);
             v.select(offset, pinned, Some(&shown));
             for key in shown.iter().filter(|k| v.index_of(k).is_some_and(|i| !v.range.contains(&i))) {
-                self.virtual_culled.insert(format!("{path}/{key}"));
+                self.virtual_culled.insert(node_path(path, Some(key), 0));
             }
             v.shown = shown;
 
@@ -420,6 +420,7 @@ impl Measurement<'_> {
                             path_ids: &mut *self.path_ids,
                             next_id: &mut *self.next_id,
                             foreground: self.defaults.foreground,
+                            missed_virtual_memo: false,
                         };
                         let (kid_slot, kid_dirty) = flatten_with_buf(
                             row_el,

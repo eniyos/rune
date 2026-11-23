@@ -68,15 +68,17 @@ impl Messages {
     /// The message for key index `key`, or `None` when this locale lacks it.
     pub fn get(&self, key: usize) -> Option<&'static str> {
         let (text, spans) = self.embedded.or_else(|| self.loaded.get().copied())?;
-        let at = key * 8;
-        let span = spans.get(at..at + 8)?;
+        let at = key.checked_mul(8)?;
+        let end = at.checked_add(8)?;
+        let span = spans.get(at..end)?;
 
         let start = u32::from_le_bytes([span[0], span[1], span[2], span[3]]);
         if start == u32::MAX {
             return None;
         }
         let len = u32::from_le_bytes([span[4], span[5], span[6], span[7]]);
-        text.get(start as usize..(start + len) as usize)
+        let text_end = start.checked_add(len)?;
+        text.get(start as usize..text_end as usize)
     }
 }
 
@@ -244,3 +246,7 @@ const fn compare(a: &[u8], b: &[u8]) -> Ordering {
     }
     Ordering::Equal
 }
+
+#[cfg(test)]
+#[path = "catalog_tests.rs"]
+mod tests;

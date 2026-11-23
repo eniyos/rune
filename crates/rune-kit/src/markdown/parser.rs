@@ -5,10 +5,12 @@ use super::*;
 
 mod builder;
 mod map;
+#[cfg(feature = "math")]
+mod math;
 mod table;
 
 use builder::{
-    Builder, Container, Fence, InlineKind, ListSlot, MAX_ELEMENT_DEPTH, MAX_FLATTENED_TAIL_ITEMS, QuoteSlot, close, open,
+    Builder, Container, Fence, InlineKind, ListSlot, MAX_ELEMENT_DEPTH, MAX_FLATTENED_TAIL_ITEMS, MAX_TABLE_COLUMNS, QuoteSlot, close, open,
 };
 use map::{code_span_content_range, map_code_span};
 use table::pending_table;
@@ -102,6 +104,8 @@ pub(super) fn parse_doc_tail(src: &str, autolink: bool) -> (ParsedDoc, Tail) {
     let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
     let mut events = super::interrupt::list_interrupts(src, Parser::new_ext(src, opts).into_offset_iter());
     let mut skip: Option<SkipMode> = None;
+    #[cfg(feature = "math")]
+    let mut math = math::Math::find(src, opts);
     while let Some((ev, range)) = events.next() {
         if let Some(mode) = &mut skip {
             match (mode, &ev) {
@@ -130,6 +134,18 @@ pub(super) fn parse_doc_tail(src: &str, autolink: bool) -> (ParsedDoc, Tail) {
                 _ => {}
             }
             continue;
+        }
+        if b.skip_cell {
+            match ev {
+                Event::End(TagEnd::TableCell) => {
+                    b.skip_cell = false;
+                    continue;
+                }
+                Event::End(TagEnd::TableHead | TagEnd::TableRow | TagEnd::Table) => {
+                    b.skip_cell = false;
+                }
+                _ => continue,
+            }
         }
         let starts_block = matches!(
             ev,
@@ -169,11 +185,19 @@ pub(super) fn parse_doc_tail(src: &str, autolink: bool) -> (ParsedDoc, Tail) {
             Event::Start(Tag::Paragraph | Tag::Item) => Tail::Inline(range.start, Scope::Para),
             Event::Start(Tag::Heading { .. }) => Tail::Inline(range.start, Scope::Line),
             // A row short of cells is padded with empty ones after its last.
-            Event::Start(Tag::TableCell) if !range.is_empty() => Tail::Inline(range.start, Scope::Cell),
+            Event::Start(Tag::TableCell)
+                if !range.is_empty() && b.table().is_none_or(|(_, cells, ..)| cells.len() < MAX_TABLE_COLUMNS) =>
+            {
+                Tail::Inline(range.start, Scope::Cell)
+            }
             Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock) => Tail::Code,
             Event::Start(Tag::Table(_)) | Event::Rule => Tail::None,
             _ => b.tail,
         };
+        #[cfg(feature = "math")]
+        if b.code.is_none() && math.claim(&mut b, src, &ev, &range) {
+            continue;
+        }
         match ev {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {
@@ -260,6 +284,7 @@ pub(super) fn parse_doc_tail(src: &str, autolink: bool) -> (ParsedDoc, Tail) {
                     b.flush_inline();
                     let align = aligns
                         .iter()
+                        .take(MAX_TABLE_COLUMNS)
                         .map(|a| match a {
                             Alignment::Center => Align::Center,
                             Alignment::Right => Align::End,
@@ -281,7 +306,11 @@ pub(super) fn parse_doc_tail(src: &str, autolink: bool) -> (ParsedDoc, Tail) {
                 }
                 Tag::TableCell => {
                     b.flush_inline();
-                    b.inline = Some((InlineKind::Cell, Inline::default(), Vec::new(), SpanMap::default()));
+                    if b.table().is_some_and(|(_, cells, ..)| cells.len() >= MAX_TABLE_COLUMNS) {
+                        b.skip_cell = true;
+                    } else {
+                        b.inline = Some((InlineKind::Cell, Inline::default(), Vec::new(), SpanMap::default()));
+                    }
                 }
                 Tag::Strong => open(&mut b, Style::Strong, None),
                 Tag::Emphasis => open(&mut b, Style::Em, None),

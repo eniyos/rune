@@ -103,6 +103,7 @@ mod window_requests;
 mod zoom;
 
 pub(crate) use commit::memo_reuse;
+pub(crate) use commit::path as element_path;
 pub(crate) use commit::text_layout::{caret_index, text_width};
 pub(crate) use commit::why::CommitWhy;
 #[cfg(all(test, debug_assertions))]
@@ -152,7 +153,7 @@ use paint::helpers::*;
 use paint::shape::push_shape;
 use paint::soft_edges::{in_fade, inherit_fade};
 
-pub(crate) use scroll::offset::ScrollRequest;
+pub(crate) use scroll::offset::{ScrollAnchor, ScrollRequest};
 pub(crate) use scroll::reveal::ScrollReveal;
 #[doc(hidden)]
 pub use scroll::watch::scroll_watch_state;
@@ -167,6 +168,8 @@ use scroll::{
 use scroll::drawn::PixelHold;
 use scroll::mode::ScrollMode;
 
+#[cfg(test)]
+pub(crate) use selection::links::count_span_box_queries;
 pub(crate) use selection::links::origin as text_origin;
 pub(crate) use selection::selectable;
 pub use selection::selectable::{SelectedText, SelectionChange, TextSelection};
@@ -180,7 +183,7 @@ pub(crate) use web::{a11y as web_a11y, export as web_export, page as web_page};
 pub(crate) use web::runtime as web_runtime;
 
 pub(crate) use anchor::anchor_position;
-use anchor::{anchor_index, step_up};
+use anchor::{anchor_ancestors, anchor_index, anchor_index_live, step_up};
 pub use cx::{Cx, Env, Waker, commit_generation};
 pub(crate) use cx::caret_of;
 use cx::COMMITS;

@@ -3,12 +3,26 @@
 //! like the glyph atlas, allocated only once an element shows pixels.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::place::{SurfaceFit, SurfacePlace};
 
 pub const IMAGE_ATLAS_SIZE: u32 = 1024;
+
+/// The largest texture side of any GPU that draws images in this process (`limit_side`).
+static LIMIT: AtomicU32 = AtomicU32::new(crate::MAX_SIDE);
+
+/// Says a GPU draws images here whose textures are at most `side` texels a side. The atlas then
+/// places nothing larger: a decoded image draws from its largest mip that fits.
+pub fn limit_side(side: u32) {
+    LIMIT.fetch_min(side.max(1), Ordering::Relaxed);
+}
+
+/// The largest side the atlas places.
+pub fn max_side() -> u32 {
+    LIMIT.load(Ordering::Relaxed)
+}
 /// Rows a shelf page starts with (`ImagePage::new`).
 const IMAGE_PAGE_START_ROWS: u32 = 128;
 
@@ -161,9 +175,11 @@ pub fn fit_in(
     let whole = [0.0, 0.0, 1.0, 1.0];
     let [x, y, w, h] = rect;
     let (iw, ih) = (size.0 as f32, size.1 as f32);
-    if fit.is_none() || iw <= 0.0 || ih <= 0.0 || w <= 0.0 || h <= 0.0 { return (rect, whole); }
+    if fit.is_none() || iw <= 0.0 || ih <= 0.0 || !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 {
+        return (rect, whole);
+    }
     let [kx, ky] = place.share();
-    let u = if (w - w.round()).abs() < 1.0 / 512.0 && (h - h.round()).abs() < 1.0 / 512.0 {
+    let u = if (w - w.round()).abs() < 1.0 / 512.0 && (h - h.round()).abs() < 1.0 / 512.0 && !snap_weight.is_nan() {
         snap_weight.clamp(0.0, 1.0)
     } else {
         0.0
@@ -187,17 +203,19 @@ pub fn fit_in(
     }
     if fit == Some(SurfaceFit::Fit) {
         let k = (w / iw).min(h / ih);
-        let (dw, dh) = ((iw * k).clamp(1.0, w), (ih * k).clamp(1.0, h));
+        let (min_w, min_h) = (w.min(1.0), h.min(1.0));
+        let (dw, dh) = ((iw * k).clamp(min_w, w), (ih * k).clamp(min_h, h));
         let exact = [x + (w - dw) * kx, y + (h - dh) * ky, dw, dh];
         if u <= 0.0 {
             return (exact, whole);
         }
-        let (sw, sh) = ((iw * k).round().clamp(1.0, w), (ih * k).round().clamp(1.0, h));
+        let (sw, sh) = ((iw * k).round().clamp(min_w, w), (ih * k).round().clamp(min_h, h));
         let snapped = [x + ((w - sw) * kx).round(), y + ((h - sh) * ky).round(), sw, sh];
         return (blend(exact, snapped), whole);
     }
     let k = (w / iw).max(h / ih);
-    let (sx, sy) = (w / (iw * k), h / (ih * k));
+    if !(k > 0.0 && k.is_finite()) { return (rect, whole); }
+    let (sx, sy) = ((w / (iw * k)).clamp(0.0, 1.0), (h / (ih * k)).clamp(0.0, 1.0));
     let ((x0, x1), (y0, y1)) = (window(sx, kx), window(sy, ky));
     (rect, [x0, y0, x1, y1])
 }
@@ -272,7 +290,7 @@ impl ImageAtlas {
     pub fn place_at(&mut self, pixels: &Pixels, drawn: [f32; 2], now: Option<f64>) -> Option<(Placed, Option<f64>)> {
         let frame = pixels.frame.lock().unwrap();
         let (mut w, mut h) = (frame.width, frame.height);
-        if w == 0 || h == 0 || w > 8192 || h > 8192 {
+        if w == 0 || h == 0 || w > crate::MAX_SIDE || h > crate::MAX_SIDE {
             return None;
         }
         let mut level = 0;
@@ -295,10 +313,14 @@ impl ImageAtlas {
                     || (next.height as f32) < drawn[1].clamp(1.0, frame.height as f32) { break; }
                 level += 1;
             }
+            // A level past the GPU's largest texture can't go up: draw from the largest that fits.
+            let limit = max_side();
+            while mips[level].width.max(mips[level].height) > limit && level + 1 < mips.len() { level += 1; }
             let mip = &mips[level];
             (w, h) = (mip.width, mip.height);
             &mip.pixels
         } else { &frame.rgba };
+        if w > max_side() || h > max_side() { return None; }
         let key = (pixels.id, level);
         if self.slots.get(&key).is_some_and(|s| s.w != w || s.h != h) {
             self.slots.remove(&key);
@@ -377,6 +399,16 @@ impl ImageAtlas {
         }
         let keep = self.slots.values().map(|s| s.page + 1).max().unwrap_or(0);
         self.pages.truncate(keep);
+    }
+
+    /// Drops every page, slot and animation start, freeing all CPU image buffers. Returns whether
+    /// the atlas held any pages or slots.
+    pub fn clear(&mut self) -> bool {
+        let had = !self.pages.is_empty() || !self.slots.is_empty() || !self.starts.is_empty();
+        self.pages.clear();
+        self.slots.clear();
+        self.starts.clear();
+        had
     }
 
     /// Marks every row for upload (a new texture).

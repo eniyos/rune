@@ -27,6 +27,44 @@ impl RuntimeCore {
         self.commit.dirty = true;
     }
 
+    /// Drops uploaded image atlas pages and every `Pixels` reference kept in the last committed
+    /// tree and memo cache, marking the view dirty so the next frame rebuilds and re-uploads any
+    /// image the view still shows.
+    #[cfg_attr(not(any(test, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))), allow(dead_code))]
+    pub(crate) fn drop_images(&mut self) {
+        let mut dropped = self.images.clear();
+        let has_tree_pixels = self.tree.nodes.iter().any(|n| {
+            n.vis.cold.get().is_some_and(|v| v.pixels.is_some())
+                || n.text.as_ref().is_some_and(|t| t.cold.pills.iter().any(|p| p.bare.as_ref().is_some_and(|b| b.image.is_some())))
+        });
+        if has_tree_pixels {
+            // Clear memos first so `Cold` / `SharedBox` refcounts drop to 1 before mutating in place.
+            self.commit.clear_memo();
+            for node in &mut self.tree.nodes {
+                if node.vis.cold.get().is_some_and(|v| v.pixels.is_some())
+                    && let Some(vis) = node.vis.cold.get_mut_if_some()
+                {
+                    vis.pixels = None;
+                }
+                if node.text.as_ref().is_some_and(|t| t.cold.pills.iter().any(|p| p.bare.as_ref().is_some_and(|b| b.image.is_some())))
+                    && let Some(text) = node.text.as_mut()
+                    && let Some(cold) = text.cold.get_mut_if_some()
+                {
+                    for pill in &mut cold.pills {
+                        if let Some(bare) = pill.bare.as_mut() {
+                            bare.image = None;
+                        }
+                    }
+                }
+            }
+            dropped = true;
+        }
+        if dropped {
+            self.commit.clear_memo();
+            self.commit.dirty = true;
+        }
+    }
+
     /// Lands every track before the next frame: growth, reveals and follow-the-end (guarantee 8,
     /// for returning to a window or session).
     pub fn settle_all(&mut self) {
@@ -100,7 +138,16 @@ impl RuntimeCore {
         // is the earliest part of the step.
         let target = self.clock + elapsed;
         if self.wall_start.is_none() && self.timer_step(target).is_some() {
-            let input = std::mem::take(&mut self.frame.queue);
+            // Immediate hover changes were already emitted by the pointer move that scheduled
+            // any hover-delay timer, so deliver them before a later leave deadline fires.
+            let mut input = Vec::new();
+            for q in std::mem::take(&mut self.frame.queue) {
+                if matches!(q.action, Action::HoverChange(..)) {
+                    self.frame.queue.push_queued(q);
+                } else {
+                    input.push(q);
+                }
+            }
             let mut catch_up = catch_up;
             while let Some(at) = self.timer_step(target) {
                 let step = at - self.clock;
@@ -196,7 +243,7 @@ impl RuntimeCore {
             }
             merge(&mut tx, one);
         }
-        if app.playground().is_some_and(|p| p.polls()) {
+        if !polled && app.playground().is_some_and(|p| p.polls()) {
             let mut one = self.transaction(app);
             let clock = self.clock;
             if self.poll_playground(app, clock, &mut one) {
@@ -240,8 +287,11 @@ impl RuntimeCore {
             // file drag find only what is mounted and reachable now (a covered window builds
             // nothing until this).
             let routed = matches!(&action, Action::Key { .. } | Action::KeyUp(_) | Action::Physical(..) | Action::Ime(_) | Action::FinishIme | Action::Paste(..) | Action::Files(_));
-            // So is a playground an earlier handler opened or moved.
-            if routed { self.latch_playground(app, &mut tx); }
+            // So is a playground an earlier handler opened or moved, and a focus change.
+            if routed {
+                self.latch_playground(app, &mut tx);
+                self.latch_focus(&mut tx);
+            }
             // Both callbacks see ordinary &mut S. After the next mutation a single view
             // cannot tell which one introduced a row. Observe the poll's tree now, without
             // drawing it or advancing time. A key already needed this same routing boundary.
@@ -341,8 +391,13 @@ impl RuntimeCore {
         self.commit.set_read_moved(read_moved);
         if self.tree.has_pixel_aspect && self.pixel_aspect_changed() { self.commit.relayout = true; }
         let settling = self.commit.is_settling();
+        let has_scroll_request = !tx.scroll_to.is_empty() || !tx.scroll_bottom.is_empty()
+            || !tx.scroll_pages.is_empty() || !tx.scroll_offsets.is_empty() || self.edit.caret_follow;
         let shifted = !(self.commit.dirty || self.commit.relayout || settling) && self.virtual_window_changed();
-        let besides = self.commit.dirty || self.commit.relayout || settling || shifted;
+        // When a scroll request is about to move viewports and nothing else needs a commit,
+        // wait for the request so we remount once at the new offset instead of filling the old one.
+        let defer_shift = shifted && !ran && !ran_layout && !read_moved && !tx.commit.lands() && has_scroll_request;
+        let besides = self.commit.dirty || self.commit.relayout || settling || (shifted && !defer_shift);
         let other = ran || besides;
         self.count_layout_echo(ran_layout || read_moved, other);
         if other || ran_layout || read_moved {
@@ -377,7 +432,7 @@ impl RuntimeCore {
             if let Some(key) = v.reveal_selected.take() && !pointer_hover {
                 // Use the keyed ancestor path so identical row keys in other lists do not
                 // intercept the reveal, including when this row is still virtual.
-                let scope = path.split('/').filter(|seg| !seg.starts_with('#')).collect::<Vec<_>>().join("/");
+                let scope = element_path::keyed_scope(path);
                 let key = if scope.is_empty() { key } else { format!("{scope}/{key}") };
                 tx.scroll_to.push(ScrollReveal::into_view(None, key));
             }
@@ -388,7 +443,11 @@ impl RuntimeCore {
             self.commit.watch_frame(commits0, scrolling, tx.scroll_offsets.iter().find(|r| tx.commit.snaps() || r.glide.is_none()).map(|r| r.key.as_str()));
         }
         let follow = std::mem::take(&mut self.edit.caret_follow);
+        let commits_before_scroll = self.commit.commits;
         self.finish_scroll_requests(app, &mut tx, follow);
+        if defer_shift && self.commit.commits == commits_before_scroll && self.virtual_window_changed() {
+            self.commit_virtual_scroll(app, &Tx::default());
+        }
         // Those scrolls moved the caret after the commit a view placed from it saw.
         if self.edit.caret_watch && self.caret_moved(None) { self.commit(app, &Tx { commit: Commit::Instant, ..Tx::default() }); }
         if let Some(request) = tx.select.take() {
@@ -401,8 +460,13 @@ impl RuntimeCore {
         self.update_interaction(None);
         #[cfg(test)]
         if let Some(publish) = tests::MID_FRAME.with(|hook| hook.borrow_mut().take()) { publish(); }
-        // Poll and input can publish after the initial wake read without committing. Sample
-        // those values now, but retain the wake: a picture may still need next frame's layout.
+        // Poll and input can publish after the initial wake read without committing. When no
+        // picture sizes itself from its image (`has_pixel_aspect`), take the wake before latching
+        // so this frame draws the published value without asking for a second, identical frame;
+        // any publication after the take still wakes the next frame. With `has_pixel_aspect`,
+        // retain the wake so a picture whose size changed after `pixel_aspect_changed` still gets
+        // next frame's layout.
+        if !self.tree.has_pixel_aspect { live_woke |= self.take_live_wake(); }
         let live_pending = live_woke || self.live_pending();
         let live_animating = self.latch_live(live_pending);
         if let Some(trace) = tx.trace.take() {

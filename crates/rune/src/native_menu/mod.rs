@@ -22,7 +22,7 @@ mod standard_macos;
 #[cfg(target_os = "macos")]
 pub(crate) use default_macos::{ensure as ensure_default_menu, promote as promote_default_menu, set_layout_direction};
 #[cfg(target_os = "macos")]
-pub(crate) use standard_macos::{adopt as adopt_standard_view, install as install_standard_menus};
+pub(crate) use standard_macos::{adopt as adopt_standard_view, install as install_standard_menus, settle as settle_standard_menus};
 #[cfg(target_os = "macos")]
 pub(crate) use key_equivalent::set_key_equivalent;
 
@@ -40,6 +40,7 @@ struct Description {
     enabled: bool,
     checked: bool,
     separator: bool,
+    alternate: bool,
 }
 
 /// A custom native item. Defaults to the app menu (after its About item, in the order given),
@@ -52,7 +53,7 @@ impl<S> MenuItem<S> {
     pub fn new(title: impl Into<String>, action: fn(&mut S, &mut Tx)) -> Self {
         let title = title.into();
         Self { description: Description { id: title.clone(), title, location: Location::App, after: None,
-            equivalent: None, keys_first: false, enabled: true, checked: false, separator: false }, action }
+            equivalent: None, keys_first: false, enabled: true, checked: false, separator: false, alternate: false }, action }
     }
     /// A separator line, placed with `menu` or `dock` like an item. It has no id or title,
     /// can't be fired, and needs no unique id.
@@ -81,6 +82,11 @@ impl<S> MenuItem<S> {
     pub fn keys_first(mut self) -> Self { self.description.keys_first = true; self }
     pub fn enabled(mut self, enabled: bool) -> Self { self.description.enabled = enabled; self }
     pub fn checked(mut self, checked: bool) -> Self { self.description.checked = checked; self }
+    /// macOS: the item before it in its menu shows this one in its place while the modifier this
+    /// one's key equivalent adds is held (Option, mostly), as AppKit's Close All stands behind
+    /// Close Window. Give it the same key with that modifier more. Elsewhere it is an item like
+    /// any other.
+    pub fn alternate(mut self) -> Self { self.description.alternate = true; self }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

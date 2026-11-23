@@ -5,6 +5,8 @@ impl RuntimeCore {
     /// Clock seconds now: the wall clock in a window (input arrives between frames), the
     /// virtual clock headless.
     pub(in crate::runtime) fn now_clock(&self) -> f64 {
+        #[cfg(test)]
+        if let Some(now) = self.frame.test_clock_now() { return now; }
         self.wall_start.map_or(self.clock, |t| t.elapsed().as_secs_f64())
     }
 
@@ -93,7 +95,7 @@ impl RuntimeCore {
                 self.pointer.hover_paused = true;
             }
         }
-        if !focused { self.edit.input_click.clear(); self.wheel_lost(); }
+        if !focused { self.edit.clear_input_click(); self.wheel_lost(); }
     }
 
     /// The window gets no more keys: it lost focus or hid, which may never report a blur. The

@@ -30,7 +30,7 @@ pub(crate) struct FrameState {
     #[cfg(debug_assertions)]
     pub(super) live_only_warnings: Vec<String>,
     pub(super) live_clock: Arc<()>,
-    pub(super) live_subscriptions: Vec<Arc<crate::live::Subscription>>,
+    pub(super) live_subscriptions: HashMap<live_latch::SourceKey, Arc<crate::live::Subscription>>,
     /// Events whose handler said `Tx::live_only`, and so didn't commit.
     pub(in crate::runtime) live_only_skips: u64,
     last_dt: f64,
@@ -62,7 +62,7 @@ impl FrameState {
             test_clock: None,
             live: live_latch::LiveLane::new(Arc::new(|| {})),
             live_clock: Arc::new(()),
-            live_subscriptions: Vec::new(),
+            live_subscriptions: HashMap::default(),
             live_only_skips: 0,
             #[cfg(debug_assertions)]
             live_only_check: true,
@@ -354,14 +354,23 @@ impl RuntimeCore {
         // A glyph mask cache write that came due while nothing draws (`mask_cache`).
         let _ = self.text.mask_cache_frame(false);
         let patched = self.patch_pending();
-        if !app.has_poll() { return patched; }
+        let has_poll = app.has_poll();
+        let has_playground = app.playground().is_some_and(|p| p.polls());
+        if !has_poll && !has_playground { return patched; }
+        let queued = self.frame.queue.len();
         let mut one = self.transaction(app);
-        let changed = self.frame.idle_meter.polled(crate::tooling::perf_warn::timed("poll", || app.poll(self.clock, &mut one)));
+        let mut changed = has_poll && self.frame.idle_meter.polled(crate::tooling::perf_warn::timed("poll", || app.poll(self.clock, &mut one)));
+        if has_playground {
+            let mut stage = self.transaction(app);
+            let clock = self.clock;
+            changed |= self.poll_playground(app, clock, &mut stage);
+            merge(&mut one, stage);
+        }
         self.commit.dirty |= changed;
         self.frame.pending.polled_change |= changed;
         let asks_frame = one.srgb_blend.is_some_and(|b| b != self.paint.srgb_blend()) || one.font_smoothing.is_some_and(|m| m != self.text.smoothing) || self.changes_families(&one) || (one.blur && self.kbd.focus.path().is_some());
         self.latch_requests(app, &mut one);
-        let stale = changed || one.frame_work() || patched || asks_frame;
+        let stale = changed || one.frame_work() || patched || asks_frame || self.frame.queue.len() > queued;
         merge(&mut self.frame.pending, one);
         stale
     }

@@ -10,6 +10,7 @@ pub(super) mod flatten;
 pub(super) mod layout_diagnostics;
 pub(super) mod measure;
 pub(crate) mod memo_reuse;
+pub(crate) mod path;
 pub(super) mod prune;
 #[cfg(test)]
 mod prune_tests;
@@ -472,6 +473,13 @@ impl RuntimeCore {
         self.commit.begin_watch(why);
         self.commit(app, tx);
         self.commit.end_watch();
+    }
+
+    /// Remounts virtual windows after a scroll request moved a viewport, without re-running
+    /// `view` when nothing the view reads has changed since the last commit.
+    pub(in crate::runtime) fn commit_virtual_scroll(&mut self, app: &mut dyn AppDriver, tx: &Tx) {
+        self.commit.set_state_unchanged(!self.commit.dirty && !self.commit.relayout && self.commit.commits > 0);
+        self.commit_for(app, tx, CommitWhy::VIRTUAL);
     }
 
     /// Restores any nodes moved out of `self.nodes` and recycles `measured`'s buffers before a

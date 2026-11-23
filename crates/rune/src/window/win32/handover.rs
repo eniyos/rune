@@ -22,7 +22,7 @@ use crate::render::{Gpu, Renderer};
 use crate::time::Instant;
 use crate::window::WakeEvent;
 use crate::window::host::{CompositorFrame, Host};
-use crate::window::surface::{Win, acquire, configure, reblend_core, rebuild_renderer_core, surface_config};
+use crate::window::surface::{Win, acquire, configure, drawable_size, max_surface_dim, reblend_core, rebuild_renderer_core, surface_config};
 
 /// Where a window's frames go. Windows that need the GPU from their first frame (a compositor,
 /// a translucent window, an overlay) are `Gpu` from the start, as on every other platform.
@@ -237,8 +237,9 @@ impl Host {
         if !matches!(l.native.mode, SurfaceMode::HandingOver { paused: false, .. }) { return; }
         if renderer.srgb_blend() != self.app.rt().srgb_blend() {
             let Some(surface) = l.surface.as_ref() else { return };
-            l.native.slot.reset();
-            if !reblend_core(surface, gpu, &mut l.config, renderer, &mut l.alpha, self.app.rt_mut()) {
+            let ok = reblend_core(surface, gpu, &mut l.config, renderer, &mut l.alpha, self.app.rt_mut());
+            l.native.slot.reconfigured(ok);
+            if !ok {
                 l.surface_ok = false;
                 return;
             }
@@ -274,6 +275,7 @@ impl Host {
             });
         } else {
             let rt = self.app.rt_mut();
+            renderer.set_fade_stops(rt.fade_stops());
             renderer.prepare_ui(&gpu.device, &gpu.queue, &mut rt.text.atlas, &rt.instances, size);
             renderer.draw(&mut enc, &view, rt.clear_color());
         }
@@ -289,9 +291,7 @@ impl Host {
         });
         renderer.submit(&gpu.queue, enc);
         gpu.queue.present(frame);
-        if let Some(surface) = l.surface.as_ref() {
-            l.native.slot.presented_surface(surface);
-        }
+        l.native.slot.presented();
         let flag = Arc::new(AtomicBool::new(false));
         let set = flag.clone();
         gpu.queue.on_submitted_work_done(move || set.store(true, Ordering::Release));
@@ -447,7 +447,8 @@ fn prepare(hwnd: isize, size: (u32, u32), srgb: bool, features: wgpu::Features, 
     // to it, and the window keeps the `Handover` as long as it keeps the surface.
     let (gpu, surface, renderer) = Gpu::for_surface(features, false,
         |instance| unsafe { instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CompositionVisual(visual)) }.map_err(|e| e.to_string()))?;
-    let (config, _) = surface_config(&surface, &gpu.adapter, (size.0.max(1), size.1.max(1)), srgb).ok_or("the GPU can't present to this window")?;
+    let size = drawable_size(None, size, max_surface_dim(Some(&gpu)));
+    let (config, _) = surface_config(&surface, &gpu.adapter, size, srgb).ok_or("the GPU can't present to this window")?;
     configure(&surface, &gpu, &config)?;
     let target_format = if srgb { config.format.remove_srgb_suffix() } else { config.format };
     let mut renderer = renderer.unwrap_or_else(|| Renderer::new(&gpu.device, target_format));

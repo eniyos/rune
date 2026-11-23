@@ -294,6 +294,20 @@ impl RuntimeCore {
         inputs.next().is_none().then_some(first)
     }
 
+    /// The topmost live, allowed element in `hits` under (x, y), in paint order.
+    pub(in crate::runtime) fn top_hit(&self, x: f32, y: f32) -> Option<usize> {
+        self.hit.find_hit(|id, r| {
+            if !self.hit_contains(id, r, x, y) { return None; }
+            let i = *self.tree.node_index.get(&id)?;
+            (!self.subtree_exiting(i) && self.allowed(i)).then_some(i)
+        })
+    }
+
+    /// Whether node `i` is `target` or an ancestor of it.
+    pub(in crate::runtime) fn node_holds(&self, i: usize, target: usize) -> bool {
+        std::iter::successors(Some(target), |&p| self.tree.nodes[p].parent).any(|p| p == i)
+    }
+
     /// The topmost element under (x, y) that takes primary input, selectable text included.
     pub(in crate::runtime) fn top_target(&self, x: f32, y: f32) -> Option<usize> {
         self.hit.find_hit(|id, r| {
@@ -305,6 +319,27 @@ impl RuntimeCore {
                 || (n.role == "button" && n.vis_flags.hit()) || n.window_drag != crate::el::WindowDrag::None || n.focus.enabled || n.handlers.modal.is_some()
                 || self.is_selectable(i))).then_some(i)
         })
+    }
+
+    /// The element under (x, y) that chooses the pointer's cursor: the topmost live, allowed hit
+    /// target painted above any primary target that sets a cursor (itself or on an ancestor not
+    /// also enclosing the primary target), else the topmost primary target.
+    pub(in crate::runtime) fn cursor_target(&self, x: f32, y: f32) -> Option<usize> {
+        let primary = self.top_target(x, y);
+        let shared_ancestor = |a: usize| primary.is_some_and(|p| self.node_holds(a, p));
+        for &(id, r) in self.hit.hits().iter().rev() {
+            if !self.hit_contains(id, r, x, y) { continue; }
+            let Some(&i) = self.tree.node_index.get(&id) else { continue };
+            if self.subtree_exiting(i) || !self.allowed(i) { continue; }
+            if Some(i) == primary { return primary; }
+            if std::iter::successors(Some(i), |&k| self.tree.nodes[k].parent)
+                .take_while(|&k| !shared_ancestor(k))
+                .any(|k| self.tree.nodes[k].handlers.cursor.is_some())
+            {
+                return Some(i);
+            }
+        }
+        primary
     }
 
     /// The element a press, hover or drag at (x, y) goes to. Selectable text passes them to the

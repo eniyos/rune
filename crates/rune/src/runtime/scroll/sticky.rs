@@ -76,6 +76,10 @@ pub(in crate::runtime) fn shift(edge: StickyEdge, inset: f32, [top, bottom, left
 /// Target rect of node `j` after its scroll viewports' offsets and any sticky shift on `j` or
 /// its ancestors, for `El::anchored`.
 pub(in crate::runtime) fn anchored_target(nodes: &[Node], scrolls: &HashMap<NodeId, ScrollState>, j: usize, viewport: (f32, f32)) -> [f32; 4] {
+    anchored_target_inner(nodes, scrolls, j, viewport, 0)
+}
+
+fn anchored_target_inner(nodes: &[Node], scrolls: &HashMap<NodeId, ScrollState>, j: usize, viewport: (f32, f32), depth: usize) -> [f32; 4] {
     let mut t = nodes[j].target;
     for [ox, oy] in scroll_offsets(scrolls, nodes, j) {
         t[0] -= ox;
@@ -84,11 +88,12 @@ pub(in crate::runtime) fn anchored_target(nodes: &[Node], scrolls: &HashMap<Node
         t[3] -= oy;
     }
     let [mut dx, mut dy] = target_shift(nodes, scrolls, j);
-    if let Some(anc) = std::iter::successors(Some(j), |&p| nodes[p].parent).find(|&p| nodes[p].above.is_some())
+    if depth < crate::runtime::anchor::MAX_ANCHOR_CHAIN
+        && let Some(anc) = std::iter::successors(Some(j), |&p| nodes[p].parent).find(|&p| nodes[p].above.is_some())
         && let Some(a) = &nodes[anc].above
         && let Some(k) = super::anchor_index(nodes, anc, a)
     {
-        let at = anchored_target(nodes, scrolls, k, viewport);
+        let at = anchored_target_inner(nodes, scrolls, k, viewport, depth + 1);
         let (w, h) = (nodes[anc].target[2] - nodes[anc].target[0], nodes[anc].target[3] - nodes[anc].target[1]);
         let (ax, ay) = super::anchor_position(a, at, (w, h), viewport);
         dx += ax - nodes[anc].target[0];
@@ -188,7 +193,7 @@ impl RuntimeCore {
         let r = self.paint.drawn[i].map(|v| v * self.env.scale);
         let r = [r[0], r[1], r[0] + r[2], r[1] + r[3]];
         if let Some(clip) = n.vis.clip {
-            inherit_fade(&mut widths, &mut origins, r, clip.map(|v| v * self.paint.inh_scratch[i].scale * self.env.scale));
+            inherit_fade(&mut widths, &mut origins, r, clip.map(|v| (v * self.paint.inh_scratch[i].scale * self.env.scale).clamp(-65504.0, 65504.0)));
         }
         if self.paint.row_mask[i] >= 0.0 {
             inherit_fade(&mut widths, &mut origins, r, [0.0, 0.0, 0.0, self.growth_feather(i)]);
@@ -348,7 +353,7 @@ impl RuntimeCore {
                 moved = true;
             }
             if !moved || !self.virtual_window_changed() { break; }
-            self.commit(app, &Tx::default());
+            self.commit_virtual_scroll(app, &Tx::default());
         }
         self.scroll.requests.restore_keeps(keeps);
     }
@@ -389,7 +394,7 @@ impl RuntimeCore {
             let Some(s) = self.viewport_of(i).filter(|&s| self.tree.nodes[s].path == r.viewport) else { continue };
             let scale = self.paint.drawn_scale[s];
             if scale <= 1e-4 { continue; }
-            let Some(cover) = self.stuck_cover(&r.viewport, &r.key) else { continue };
+            let Some(cover) = self.stuck_cover(&r.viewport, r.scope.as_deref(), &r.key) else { continue };
             let cover = cover / f64::from(scale);
             let rel_top = f64::from((drawn_top - self.paint.drawn[s][1]) / scale) - cover;
             let height = f64::from(drawn_h / scale) + cover;
@@ -470,14 +475,15 @@ impl RuntimeCore {
                 .is_some_and(|(i, _)| !self.subtree_exiting(i) && in_viewport(i))
     }
 
-    /// What a reveal of row `key` in viewport `path` must leave to stuck headers: `None` when
-    /// the row is, or is inside, a header stuck in view (it shows already), else the height
-    /// stuck headers cover at the viewport's top, which the reveal keeps the row clear of.
-    pub(in crate::runtime) fn stuck_cover(&self, path: &str, key: &str) -> Option<f64> {
+    /// What a reveal of row `key` (within `scope`, when given) in viewport `path` must leave to
+    /// stuck headers: `None` when the row is, or is inside, a header stuck in view (it shows
+    /// already), else the height stuck headers cover at the viewport's top, which the reveal keeps
+    /// the row clear of.
+    pub(in crate::runtime) fn stuck_cover(&self, path: &str, scope: Option<&str>, key: &str) -> Option<f64> {
         if !self.tree.has_sticky || self.scroll.stuck.len() != self.tree.nodes.len() || self.paint.drawn.len() != self.tree.nodes.len() { return Some(0.0) }
         let Some(s) = self.tree.nodes.iter().position(|n| n.path == path) else { return Some(0.0) };
         let view = self.paint.drawn[s];
-        let row = self.live_named(None, key);
+        let row = self.live_named(scope, key).filter(|&r| self.viewport_of(r) == Some(s));
         let holder = row.and_then(|r| std::iter::successors(Some(r), |&p| self.tree.nodes[p].parent).take_while(|&p| p != s).find(|&p| self.scroll.stuck[p] != 0.0 && self.tree.nodes[p].sticky.as_ref().is_none_or(|s| s.edge != Some(StickyEdge::Left))));
         if let (Some(r), Some(_)) = (row, holder) {
             let d = self.paint.drawn[r];

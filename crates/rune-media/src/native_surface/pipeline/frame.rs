@@ -371,7 +371,8 @@ impl SurfaceRenderer {
             // Weak: the queue keeps this closure until it runs, and a queue held by it would keep
             // the queue (and the closure) alive for good if its device is lost first.
             let queue = Arc::downgrade(self.timing_queue.get_or_init(|| Arc::new(queue.clone())));
-            let completion = self.completion.clone();
+            let completion = self.completion.waker();
+            let resolves = self.resolves.clone();
             // Metal counter resolves can race the render pass's final fragment sample when
             // encoded into the same command buffer. Resolve after its completion fence; this
             // is timestamp metadata only, never a readback or wait on the video pixel path.
@@ -379,13 +380,13 @@ impl SurfaceRenderer {
                 let completed_at = rune_core::time::now();
                 // The renderer is gone (its device lost and replaced, or the app closing): nothing
                 // resolves the times.
-                let Some(queue) = queue.upgrade() else {
+                if queue.strong_count() == 0 {
                     for (s, _, mut t) in frames {
                         t.completed_at = Some(completed_at);
                         s.report(t);
                     }
                     return;
-                };
+                }
                 let mut timestamps = device.create_command_encoder(&Default::default());
                 timestamps.resolve_query_set(&queries.pool.queries, queries.start..queries.start + 2, &resolve, 0);
                 timestamps.copy_buffer_to_buffer(&resolve, 0, &readback, 0, 16);
@@ -412,8 +413,14 @@ impl SurfaceRenderer {
                         s.report(t);
                     }
                 });
-                queue.submit([timestamps.finish()]);
-                completion.try_send(()).ok();
+                // This runs on whichever thread polls the device, usually the completion thread:
+                // submitted from here while the window's thread configures a surface, the
+                // resolve makes wgpu refuse the configuration. It is parked, and submitted now
+                // unless a surface is being configured; the completion thread, woken below,
+                // submits it after one that is.
+                resolves.park((queue, timestamps.finish()));
+                resolves.submit();
+                completion.wake();
             });
         } else {
             encoder.on_submitted_work_done(move || {
@@ -425,7 +432,7 @@ impl SurfaceRenderer {
         }
         let index = queue.submit([encoder.finish()]);
         self.release_decoded(queue);
-        self.completion.try_send(()).ok();
+        self.completion.wake();
         index
     }
 
@@ -496,7 +503,7 @@ mod abi_tests {
 
         let source = include_str!("../video.wgsl");
         let module = wgsl::parse_str(source).unwrap_or_else(|e| panic!("{}", e.emit_to_string(source)));
-        Validator::new(ValidationFlags::all(), Capabilities::default() | Capabilities::SHADER_FLOAT16_IN_FLOAT32)
+        Validator::new(ValidationFlags::all(), Capabilities::default())
             .validate(&module)
             .expect("validate video.wgsl");
         let mut layouter = Layouter::default();

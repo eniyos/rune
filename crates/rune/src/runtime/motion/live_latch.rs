@@ -39,6 +39,8 @@ pub(crate) enum LiveEvent {
     LatchBegin,
     /// The latch read the sources; `active` says one is still moving.
     LatchEnd { active: bool },
+    /// A visible frame had no bound sources to read, so any pending wake is cleared.
+    Clear,
 }
 
 impl LiveWake {
@@ -82,6 +84,9 @@ impl LiveWake {
             // A value still moving after the read keeps the next frame due.
             (Hidden { dirty }, LiveEvent::LatchEnd { active }) => (Hidden { dirty: dirty || active }, active),
             (_, LiveEvent::LatchEnd { active }) => (if active { Pending } else { Idle }, active),
+            // A visible frame with no bound sources has nothing to read, so any pending wake is spent.
+            (Hidden { .. }, LiveEvent::Clear) => (self, false),
+            (_, LiveEvent::Clear) => (Idle, false),
         }
     }
 }
@@ -144,10 +149,16 @@ impl LiveLane {
         self.wake.take_visible()
     }
 
-    /// Whether the frame should read its sources now. The hidden, source-less and clean cases
-    /// return before any transition, as an unpending frame always did.
+    /// Whether the frame should read its sources now. A hidden or clean frame returns before
+    /// any transition. A visible frame with no bound sources has nothing to read, so any
+    /// pending wake is cleared rather than keeping the window redrawing until the next commit.
     pub(crate) fn latch_begin(&mut self, can: bool, has_subs: bool) -> bool {
-        if !self.visible() || !has_subs || (!can && !self.state.dirty()) { return false; }
+        if !self.visible() { return false; }
+        if !has_subs {
+            if self.state.dirty() { self.apply(LiveEvent::Clear); }
+            return false;
+        }
+        if !can && !self.state.dirty() { return false; }
         self.apply1(LiveEvent::LatchBegin)
     }
 
@@ -165,6 +176,37 @@ impl LiveLane {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static SOURCE_KEY_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Key for `FrameState::live_subscriptions`. Compiles to a plain `u64` outside tests; in tests,
+/// equality comparisons count lookups so regression tests prove `subscribe_live` is linear.
+#[derive(Clone, Copy, Debug, Eq, Hash)]
+#[repr(transparent)]
+pub(super) struct SourceKey(pub(super) u64);
+
+#[cfg(not(test))]
+impl PartialEq for SourceKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool { self.0 == other.0 }
+}
+
+#[cfg(test)]
+impl PartialEq for SourceKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        SOURCE_KEY_COMPARISONS.with(|c| c.set(c.get() + 1));
+        self.0 == other.0
+    }
+}
+
+#[cfg(test)]
+fn take_source_key_comparisons() -> usize {
+    SOURCE_KEY_COMPARISONS.with(|c| c.replace(0))
+}
+
 impl timer_wake::FrameState {
     pub(in crate::runtime) fn subscribe_live(&mut self, nodes: &mut [Node], scene: &Scene, clock: f64) {
         for node in nodes.iter_mut() {
@@ -172,7 +214,7 @@ impl timer_wake::FrameState {
                 for bound in &mut cold.live { bound.attach(&self.live_clock, clock); }
             }
         }
-        for sub in &self.live_subscriptions { sub.active.store(false, Ordering::Release); }
+        for sub in self.live_subscriptions.values() { sub.active.store(false, Ordering::Release); }
         // Pixels only wake: each frame's build uploads their current image, so unlike bound
         // values they leave nothing to sample on a later visible frame.
         let mut sampled = false;
@@ -189,14 +231,13 @@ impl timer_wake::FrameState {
             if !scene.contains(node.id) { continue; }
             sampled |= text.is_some() || has_live;
             for source in node.live.iter().map(|b| &b.source).chain(text).chain(pixels) {
-                if let Some(sub) = self.live_subscriptions.iter().find(|s| s.source_id == source.id()) {
-                    sub.active.store(true, Ordering::Release);
-                } else {
-                    self.live_subscriptions.push(source.subscribe(self.live.waker()));
-                }
+                self.live_subscriptions
+                    .entry(SourceKey(source.id()))
+                    .and_modify(|sub| sub.active.store(true, Ordering::Release))
+                    .or_insert_with(|| source.subscribe(self.live.waker()));
             }
         }
-        self.live_subscriptions.retain(|s| s.active.load(Ordering::Acquire));
+        self.live_subscriptions.retain(|_, s| s.active.load(Ordering::Acquire));
         self.live.subscribed(sampled);
     }
 
@@ -227,14 +268,14 @@ impl timer_wake::FrameState {
                 let (op, active_now) = bound.read(&self.live_clock, clock);
                 active |= active_now;
                 let Some(op) = op else { continue };
-                let (enter, leave) = (bound.spring, bound.rest_spring);
+                let (enter, leave) = (bound.enter, bound.leave);
                 use crate::live::{LatchOp, LiveValue, Property};
                 fn apply<T: rune_motion::Animatable + Copy>(
                     scene: &mut Scene,
                     id: NodeId,
                     prop: Prop<T>,
-                    enter: Option<Spring>,
-                    leave: Option<Spring>,
+                    enter: Option<rune_motion::Anim>,
+                    leave: Option<rune_motion::Anim>,
                     decode: impl Fn(u128) -> T,
                     op: LatchOp,
                     choose_leave: impl Fn(Option<T>, T) -> bool,
@@ -243,9 +284,9 @@ impl timer_wake::FrameState {
                         LatchOp::Snap(bits) => scene.set(id, prop, decode(bits)),
                         LatchOp::Set(bits) => {
                             let v = decode(bits);
-                            let spring = if choose_leave(scene.get(id, prop), v) { leave.or(enter) } else { enter };
-                            match spring {
-                                Some(s) => scene.animate(id, prop, v, s),
+                            let anim = if choose_leave(scene.get(id, prop), v) { leave.or(enter) } else { enter };
+                            match anim {
+                                Some(a) => scene.animate(id, prop, v, a),
                                 None => scene.set(id, prop, v),
                             }
                         }
@@ -258,7 +299,7 @@ impl timer_wake::FrameState {
                             let active_v = decode(active);
                             let leave_s = leave.unwrap_or(enter_s);
                             scene.animate(id, prop, active_v, enter_s);
-                            scene.animate(id, prop, rest_v, rune_motion::Anim { delay: (hold as f32).max(1e-4), ..leave_s.into() });
+                            scene.animate(id, prop, rest_v, rune_motion::Anim { delay: (hold as f32).max(1e-4), ..leave_s });
                         }
                     }
                 }
@@ -343,7 +384,7 @@ impl RuntimeCore {
 
     /// Install before the first frame. Live updates use this separate coalesced wake lane.
     pub(crate) fn set_live_waker(&mut self, waker: Waker) {
-        for sub in &self.frame.live_subscriptions { sub.active.store(false, Ordering::Release); }
+        for sub in self.frame.live_subscriptions.values() { sub.active.store(false, Ordering::Release); }
         self.frame.live_subscriptions.clear();
         self.frame.live.replace_waker(waker);
         self.subscribe_live();
@@ -354,7 +395,9 @@ impl RuntimeCore {
         self.frame.live.set_visible(visible);
         if !visible { self.motion.clear_loop_wake(); }
         // The window's own setup shows and hides it before the first frame; the app hears the
-        // changes after that (`App::on_visibility`).
+        // changes after that (`App::on_visibility`), and its poll runs once to read
+        // `Tx::window_visible`, which a window that stops drawing wouldn't otherwise run.
+        if changed && self.commit.commits > 0 && app.has_poll() { self.schedule_wakes([std::time::Duration::ZERO]); }
         if changed && self.commit.commits > 0 && app.has_on_visibility() {
             let (mut one, stall) = self.begin_update(app);
             app.on_visibility(visible, &mut one);

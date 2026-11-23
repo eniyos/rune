@@ -125,10 +125,12 @@ impl RuntimeCore {
     }
 
     /// A Ctrl + wheel `dy` at (x, y), which is how a trackpad pinch reaches Windows, Linux and
-    /// web apps: a pinch when an `on_magnify` handler is there (true), else nothing.
+    /// web apps, and how Chromium hands any page Ctrl + wheel: a pinch (`MagnifyEvent::wheel`) when
+    /// an `on_magnify` handler is there (true), else nothing. `dy` moves content down, so the wheel
+    /// turned away from the user (or the fingers spread) zooms in, as in a browser.
     pub(crate) fn pinch_wheel(&mut self, x: f32, y: f32, dy: f32) -> bool {
         if dy == 0.0 || self.gesture_chain(x, y, |g| g.magnify.is_some(), false).is_empty() { return false; }
-        self.magnify_event(MagnifyEvent::new(-dy / PINCH_WHEEL).at(x, y));
+        self.magnify_event(MagnifyEvent { wheel: true, ..MagnifyEvent::new(dy / PINCH_WHEEL).at(x, y) });
         true
     }
 
@@ -238,10 +240,11 @@ impl RuntimeCore {
         let [lx, ly] = self.to_local(i, x, y);
         let d = Drag { phase: Phase::Down, x: lx, y: ly, w: r[2] - r[0], h: r[3] - r[1], start_x: lx, start_y: ly, dx: 0.0, dy: 0.0, data: 0.0, clicks: 1, cancelled: false, window: [x, y], screen: self.screen_at(x, y) };
         let path = n.path.clone();
-        if self.drags_with(i, button) { self.frame.queue.push(Action::Drag(path.clone(), d, button)); }
+        let drag_handler = self.drags_with(i, button).then(|| n.handlers.on_drag.clone()).flatten();
+        if drag_handler.is_some() { self.frame.queue.push(Action::Drag(path.clone(), d, button)); }
         self.pointer.clear_press_clicks();
         let now = self.now_clock();
-        self.pointer.press.hold(capture::Held::new(path, d, button, (x, y), now, false, None).on_link(link));
+        self.pointer.press.hold(capture::Held::new(path, d, button, (x, y), now, false, None).on_link(link).drag_handler(drag_handler));
     }
 
     /// Element `i` opted in to `button` ([`El::pointer_buttons`]); every element takes the

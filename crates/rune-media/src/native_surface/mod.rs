@@ -4,6 +4,8 @@
 //! CPU byte frames provide a portable source and a reference for headless verification.
 
 #[cfg(test)]
+mod completion_tests;
+#[cfg(test)]
 #[path = "tests.rs"]
 mod gpu_tests;
 #[cfg(target_os = "linux")]
@@ -12,6 +14,8 @@ pub mod linux;
 mod place_tests;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "windows")]
+mod dxbc;
 mod pipeline;
 #[cfg(target_os = "windows")]
 pub mod windows;

@@ -58,7 +58,7 @@ impl RuntimeCore {
             let n = &self.tree.nodes[i];
             let end = self.subtree_end(i);
             while stack.last().is_some_and(|&(e, _)| i >= e) { stack.pop(); }
-            if !self.allowed(i) || self.subtree_exiting(i) || n.vis.opacity <= 0.01 || n.input.is_some() {
+            if !self.allowed(i) || self.subtree_exiting(i) || n.vis.opacity <= 0.01 || n.input.is_some() || n.is_secure() {
                 i = end;
                 continue;
             }
@@ -92,7 +92,7 @@ impl RuntimeCore {
         let n = &self.tree.nodes[i];
         let mut attrs = String::new();
         let mut inner = String::new();
-        let href = n.a11y.more.as_ref().and_then(|m| m.href.clone());
+        let href = n.a11y.more.as_ref().and_then(|m| m.href.as_deref()).and_then(|u| crate::open_url::check_href(u).ok());
         let label = n.label.as_deref().filter(|s| !s.trim().is_empty());
         let pixels = n.vis.cold.pixels.as_ref().filter(|_| i + 1 == self.subtree_end(i));
         let pixels_url = pixels.and_then(|p| p.source_url());
@@ -132,7 +132,7 @@ impl RuntimeCore {
         let mut decls = css::layout(&self.commit.layout.style(n.taffy).to_style(), i == 0);
         let [x0, y0, x1, y1] = n.target;
         css::paint(&n.vis, (x1 - x0, y1 - y0), &mut decls);
-        if let Some(spec) = n.text.as_deref() {
+        if let Some(spec) = n.text.as_deref().filter(|t| !t.redacted && !n.is_secure()) {
             css::text(spec, &mut decls);
             inner = css::text_html(spec);
         } else if let Some(shape) = n.vis.cold.shape.as_deref() {

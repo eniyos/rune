@@ -205,7 +205,7 @@ impl RuntimeCore {
 
     pub fn elements(&self) -> Vec<ElementInfo> {
         fn intent(n: &Node) -> u32 {
-            n.live.iter().filter(|b| b.spring.is_none()).fold(0, |bits, b| bits | match b.property {
+            n.live.iter().filter(|b| b.enter.is_none()).fold(0, |bits, b| bits | match b.property {
                 crate::live::Property::Offset => 1,
                 crate::live::Property::Scale | crate::live::Property::Rect => 1 | 2,
                 crate::live::Property::Opacity => 4,
@@ -267,6 +267,7 @@ impl RuntimeCore {
                 // window), the scales holding still above it carry them, unturned.
                 let mut lifted = None;
                 let mut j = i;
+                let mut steps = 0usize;
                 loop {
                     let to_window = |at: Option<usize>, v: [f32; 2]| match lifted {
                         Some(k) => v.map(|c| c * k),
@@ -286,8 +287,11 @@ impl RuntimeCore {
                         scrolled = [scrolled[0] - fix[0] * k, scrolled[1] - fix[1] * k];
                     }
                     if lifted.is_none() && self.motion.flying.iter().any(|f| f.0 == id) {
-                        lifted = Some(parent.and_then(|p| self.paint.inh_scratch.get(p)).map_or(1.0, |h| h.still.0));
+                        let is_launch = self.motion.launches().launched(id);
+                        lifted = Some(parent.and_then(|p| self.paint.inh_scratch.get(p)).map_or(1.0, |h| if is_launch { h.still.0 } else { h.held.0 }));
                     }
+                    steps += 1;
+                    if steps >= self.tree.nodes.len() { break; }
                     let Some(pi) = step_up(&self.tree.nodes, j) else { break };
                     let p = &self.tree.nodes[pi];
                     moving |= animating(p.id)
@@ -410,9 +414,10 @@ impl RuntimeCore {
     }
 
     /// Drawn rect `[x, y, w, h]` in points and effective opacity (ancestors included) of the
-    /// element keyed `key`, exiting or not, as of the last frame.
+    /// element keyed `key` (or key path such as `card-2/title`), exiting or not, as of the last
+    /// frame.
     pub fn presented(&self, key: &str) -> Option<([f32; 4], f32)> {
-        let i = self.tree.index_of_key(key)?;
+        let i = self.tree.selects_index(key)?;
         Some((*self.paint.drawn.get(i)?, self.paint.inh_scratch.get(i)?.opacity))
     }
 
@@ -515,7 +520,7 @@ impl RuntimeCore {
             }
         }).collect();
         let moving = self.rect_springing(i)
-            || std::iter::successors(Some(i), |&p| step_up(&self.tree.nodes, p)).any(|p| {
+            || anchor_ancestors(&self.tree.nodes, i).any(|p| {
                 let id = self.tree.nodes[p].id;
                 paint_pose_springing(store, id)
                     || (!self.reduced_motion && self.motion.loop_active(id, store.node_time(id)))
@@ -541,7 +546,5 @@ impl RuntimeCore {
 /// Whether `path`'s keyed segments end with `key`'s: `slider/knob` matches
 /// `form/#2/slider/#0/knob`, since the `#n` segments stand for elements without keys.
 fn keyed_suffix(path: &str, key: &str) -> bool {
-    let unkeyed = |s: &&str| s.len() > 1 && s.starts_with('#') && s[1..].bytes().all(|b| b.is_ascii_digit());
-    let mut keyed = path.rsplit('/').filter(|s| !unkeyed(s));
-    key.rsplit('/').all(|want| keyed.next() == Some(want))
+    element_path::keyed_suffix_matches(path, key)
 }

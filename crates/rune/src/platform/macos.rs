@@ -6,7 +6,7 @@ use objc2::rc::Retained;
 use objc2_app_kit::{NSEvent, NSPanel, NSWindow, NSResponder, NSScreen, NSView};
 use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize};
 use crate::{KeyPolicy, OverlayInput, OverlayLevel, OverlayOptions, OverlaySupport};
-use std::{cell::{Cell, RefCell}, rc::Rc, time::Instant};
+use std::{cell::{Cell, RefCell}, rc::Rc};
 
 #[doc(hidden)]
 pub mod appearance;
@@ -15,6 +15,7 @@ pub(crate) mod drop;
 mod geometry;
 mod hold;
 pub(crate) mod help;
+pub(crate) mod launch;
 #[doc(hidden)]
 pub mod panel_bridge;
 mod pointer;
@@ -29,7 +30,7 @@ pub(crate) use pointer::PointerState;
 pub(crate) use presentation::Prewarm;
 #[cfg(test)]
 pub(crate) use surface::layer_occluded;
-pub(crate) use surface::{PresumeShown, pin_contents_top_left, present_with_transaction, surface_occluded, window_occluded};
+pub(crate) use surface::{PresumeShown, flush_while_launching, launching, pin_contents_top_left, present_with_transaction, surface_occluded, sync_contents_scale, window_occluded};
 use geometry::{overlay_rect_on, screen_id};
 use pointer::MouseMonitors;
 use presence::Presence;
@@ -118,6 +119,23 @@ pub(crate) fn ns_window(window: &winit::window::Window) -> Option<Retained<NSWin
     content_view(window)?.window()
 }
 
+/// Whether key-value observing (or another runtime subclass that hides itself from `-class`)
+/// sits on `object`. Placing a Rune per-instance subclass above KVO's crashes Foundation when
+/// an observer is removed.
+#[allow(unsafe_code)]
+pub(crate) unsafe fn kvo_observed(object: &objc2::runtime::AnyObject) -> bool {
+    // SAFETY: caller guarantees `object` is a live ObjC instance; `-class` takes no arguments.
+    let reported: &objc2::runtime::AnyClass = unsafe { msg_send![object, class] };
+    let actual = object.class();
+    !std::ptr::eq(reported, actual) || actual.name().to_bytes().starts_with(b"NSKVONotifying_")
+}
+
+/// Whether any class in `object`'s runtime superclass chain starts with `prefix`.
+pub(crate) fn has_subclass(object: &objc2::runtime::AnyObject, prefix: &[u8]) -> bool {
+    std::iter::successors(Some(object.class()), |c| c.superclass())
+        .any(|c| c.name().to_bytes().starts_with(prefix))
+}
+
 pub(crate) fn configure_window(window: &winit::window::Window, options: &crate::MacWindowOptions) {
     crate::platform::macos::appearance::install();
     if let Some(window) = ns_window(window) { configure_native(&window, options); }
@@ -161,7 +179,6 @@ pub(crate) struct Panel {
     pointer: Rc<PointerState>,
     options: OverlayOptions,
     follow_pointer: Cell<bool>,
-    pointer_poll: Cell<Option<Instant>>,
     /// Prewarmed, shown or fading, under one fence, and the requested capture exclusion,
     /// applied only while shown. While a fade runs the panel reads as visible, so a fading-out
     /// overlay can still draw its exit.
@@ -188,7 +205,7 @@ impl Panel {
 
     #[allow(unsafe_code)]
     fn adopt_kind(window: &winit::window::Window, at: crate::overlay::Placement, interactive: bool, options: &OverlayOptions, wake: Option<crate::Waker>, ordinary: bool) -> Option<Panel> {
-        use objc2_app_kit::{NSBackingStoreType, NSColor, NSWindowCollectionBehavior, NSWindowStyleMask};
+        use objc2_app_kit::{NSBackingStoreType, NSColor, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask};
         let mtm = MainThreadMarker::new()?;
         crate::platform::macos::appearance::install();
         let view = content_view(window)?;
@@ -239,6 +256,9 @@ impl Panel {
         if options.prewarm {
             panel.setAlphaValue(0.0);
             panel.setIgnoresMouseEvents(true);
+            // AppKit's default animation scales and fades an NSPanel in over ~280 ms on
+            // order-in; a prewarmed panel reveals cached pixels at once (or runs its own fade).
+            panel.setAnimationBehavior(NSWindowAnimationBehavior::None);
         }
         // defer:NO creates the WindowServer identity while hidden. Never publish a sentinel
         // (-1/0) cast to CGWindowID as a successful native creation.
@@ -254,7 +274,7 @@ impl Panel {
             return None;
         }
         panel.setDelegate(ns_window.delegate().as_deref());
-        Some(Panel { bridge, monitors: RefCell::new(None), pointer, options: options.clone(), follow_pointer: Cell::new(options.follow_pointer), pointer_poll: Cell::new(None), presence, wake, panel, window: ns_window, view })
+        Some(Panel { bridge, monitors: RefCell::new(None), pointer, options: options.clone(), follow_pointer: Cell::new(options.follow_pointer), presence, wake, panel, window: ns_window, view })
     }
 
     /// On the primary screen (the one with the menu bar), in AppKit's bottom-left coordinates.
@@ -348,5 +368,69 @@ pub(crate) fn dock_badge(window: &winit::window::Window, count: u32) {
         let label = (total > 0).then(|| objc2_foundation::NSString::from_str(&total.to_string()));
         let label: *const objc2::runtime::AnyObject = label.as_deref().map_or(std::ptr::null(), |l| (l as *const objc2_foundation::NSString).cast());
         let _: () = msg_send![tile, setBadgeLabel: label];
+    }
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+pub(crate) mod test_pasteboard {
+    use objc2::rc::Retained;
+    use objc2::{class, msg_send};
+    use objc2_app_kit::{NSPasteboard, NSPasteboardItem};
+    use objc2_foundation::{NSArray, NSString};
+
+    /// A private named pasteboard, released globally when dropped.
+    pub(crate) struct Board(Retained<NSPasteboard>);
+
+    impl Drop for Board {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a private named pasteboard created via `pasteboardWithName:` and released once on drop.
+            unsafe { msg_send![&*self.0, releaseGlobally] }
+        }
+    }
+
+    impl std::ops::Deref for Board {
+        type Target = NSPasteboard;
+        fn deref(&self) -> &NSPasteboard { &self.0 }
+    }
+
+    /// Creates a private named pasteboard unique to this call. `+[NSPasteboard pasteboardWithUniqueName]`
+    /// stamps names from `mach_absolute_time`, so parallel tests that start within one tick receive
+    /// the same `NSPasteboard` instance and overwrite each other's items.
+    fn create() -> Option<Board> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = NSString::from_str(&format!("dev.rune.test.{}.{n}", std::process::id()));
+        // SAFETY: `+[NSPasteboard pasteboardWithName:]` takes an `NSString` and returns a retained or
+        // nil `NSPasteboard`; the private pasteboard is released once in `Board::drop`.
+        let pb: Option<Retained<NSPasteboard>> = unsafe { msg_send![class!(NSPasteboard), pasteboardWithName: &*name] };
+        pb.map(Board)
+    }
+
+    /// Whether this session has a pasteboard server. A headless or SSH-only session (no window
+    /// server) has none, and `pasteboardWithName:` returns nil or refuses writes there, so tests
+    /// skip with a note instead of panicking.
+    pub(crate) fn available() -> bool {
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            let probe = std::panic::catch_unwind(|| {
+                let Some(pb) = create() else { return false };
+                pb.clearContents();
+                let item = NSPasteboardItem::new();
+                let kind = NSString::from_str("public.utf8-plain-text");
+                item.setString_forType(&NSString::from_str("probe"), &kind)
+                    && pb.writeObjects(&NSArray::from_retained_slice(&[objc2::runtime::ProtocolObject::from_retained(item)]))
+                    && pb.stringForType(&kind).is_some_and(|s| s.to_string() == "probe")
+            });
+            let ok = probe.unwrap_or(false);
+            if !ok { eprintln!("macos: no pasteboard in this session (headless?); skipping pasteboard round-trip tests"); }
+            ok
+        })
+    }
+
+    /// A private named pasteboard unique to this call, or `None` without a pasteboard server.
+    pub(crate) fn unique() -> Option<Board> {
+        if !available() { return None; }
+        create()
     }
 }

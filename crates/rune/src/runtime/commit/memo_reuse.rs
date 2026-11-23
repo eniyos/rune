@@ -136,6 +136,9 @@ pub(in crate::runtime) struct MemoFlattenCtx<'a> {
     pub(in crate::runtime) next_id: &'a mut u64,
     /// What text, icons and text fields without their own colour draw in (`Cx::foreground`).
     pub(in crate::runtime) foreground: Option<Color>,
+    /// Set when flattening falls through on an unexpanded `HAS_VIRTUAL` memo placeholder whose
+    /// virtual lists `keeps_windows` skipped populating.
+    pub(in crate::runtime) missed_virtual_memo: bool,
 }
 
 fn opt_rc_eq<T: ?Sized>(a: &Option<Rc<T>>, b: &Option<Rc<T>>) -> bool {
@@ -483,7 +486,7 @@ fn path_matches(old_path: &str, parent_path: &str, key: Option<&str>, index: usi
         rest
     };
     match key {
-        Some(k) => tail == k,
+        Some(k) => !tail.contains('/') && super::path::segment_matches_key(tail, k),
         None => tail.strip_prefix('#').is_some_and(|n| !n.contains('/') && n.parse::<usize>().ok() == Some(index)),
     }
 }

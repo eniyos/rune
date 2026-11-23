@@ -17,7 +17,7 @@ impl OverlayCore {
         // A running display link consumes due runtime timers. Keep the independent
         // pointer deadline, but do not spin on an overdue animation timer. Without one (hidden,
         // covered, faded out or unpaced), a timer due sooner than a frame waits a frame.
-        let deadline = crate::window::timer_deadline_core(rt);
+        let deadline = frame::timer_deadline(rt, self.awaiting_layer_frame());
         // A frame waiting for room in the swap chain comes when there is (`slot`): its timers
         // would turn the loop at once until then.
         let deadline = deadline.filter(|_| !self.waits_for_slot());
@@ -28,6 +28,14 @@ impl OverlayCore {
         // A Windows fade-out steps its alpha once a frame.
         #[cfg(target_os = "windows")]
         let deadline = deadline.into_iter().chain(self.presence.fading().then(|| crate::time::now() + crate::window::TIMER_FRAME)).min();
+        // Wayland layer-shell overlays schedule held-key repeats on the overlay wake timer.
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        let deadline = deadline.into_iter().chain(self.presence.drawing().then(|| {
+            match self.surface.live().map(|l| &l.backing) {
+                Some(Backing::Layer(layer)) => layer.repeat_deadline(),
+                _ => None,
+            }
+        }).flatten()).min();
         deadline.into_iter().chain(self.backoff.deadline().filter(|_| self.presence.drawing())).chain(self.presence.deadline())
             .chain(self.hidden_pace.deadline().filter(|_| !self.presence.drawing())).min()
     }
@@ -158,7 +166,7 @@ impl AnyHost for OverlayHost {
                 {
                     crate::platform::ime::cancel(window);
                     window.set_ime_allowed(false);
-                    core.ime_allowed = false;
+                    core.ime.clear();
                 }
             }
             app.rt_mut().ignore_minimize("an overlay");
@@ -249,11 +257,19 @@ impl AnyHost for OverlayHost {
                 core.dirty = true;
             }
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } if core.options.keys == KeyPolicy::OnDemand => {
-                core.dirty |= app.keyboard(&core.clipboard, &event, core.mods);
+                if event.state == winit::event::ElementState::Pressed
+                    && let Some(window) = core.surface.live().and_then(|l| l.backing.window())
+                    && let Some(text) = crate::platform::ime::take_direct_commit(window)
+                {
+                    host_events::ime(app.rt_mut(), window, &mut core.ime, winit::event::Ime::Commit(text));
+                    core.dirty = true;
+                } else {
+                    core.dirty |= app.keyboard(&core.clipboard, &event, core.mods);
+                }
             }
             WindowEvent::Ime(ime) if core.options.keys == KeyPolicy::OnDemand => {
                 if let Some(window) = core.surface.live().and_then(|l| l.backing.window()) {
-                    host_events::ime(app.rt_mut(), window, ime);
+                    host_events::ime(app.rt_mut(), window, &mut core.ime, ime);
                     core.dirty = true;
                 }
             }

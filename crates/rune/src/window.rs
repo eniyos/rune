@@ -52,8 +52,10 @@ pub(crate) use state::{Life, Minimize, MinimizeEvent, Sight};
 pub(crate) use surface::{
     Backoff, BackoffEffect, BackoffEvent, HiddenPace, Missed, Presented, TIMER_FRAME,
     acquire_checked, configure, reblend_core, rebuild_renderer_core,
-    surface_config, timer_deadline_core, timer_wants_frame_core,
+    poll_timer_deadline_core, surface_config, timer_deadline_core, timer_wants_frame_core,
 };
+#[cfg(target_arch = "wasm32")]
+pub(crate) use surface::configure_then;
 #[cfg(test)]
 pub(crate) use surface::{
     HIDDEN_REFRESH, OCCLUDED_MAX, OCCLUDED_RETRY, TIMEOUT_RETRY, TIMER_FRAME_STALL, TimerFrame,
@@ -77,7 +79,7 @@ use surface::LaunchDrawables;
 use surface::{SurfaceRetries, composing};
 
 /// Records a presented frame and wakes Windows' deferred ICU word segmenter on the first one.
-pub(super) fn frame_presented() {
+pub(crate) fn frame_presented() {
     if crate::marks::presented() {
         #[cfg(all(target_os = "windows", not(feature = "segmenter-dictionaries")))]
         crate::platform::win32::segmenter::first_frame_presented();
@@ -172,6 +174,9 @@ struct Windows {
     hosts: Vec<Option<Box<dyn AnyHost>>>,
     // Weak pool preserves release_gpu_when_closed when the last GPU owner closes.
     gpu: Rc<RefCell<Weak<Gpu>>>,
+    /// Fatal Wayland display error captured while `ActiveEventLoop` is still alive.
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+    display_error: Option<String>,
 }
 impl Windows {
     /// Starts the windows `crate::open_window` asked for this turn, in fresh slots, each like
@@ -273,7 +278,7 @@ pub(crate) fn start<S: 'static>(mut spec: WindowSpec<S>, handle: Option<WindowHa
     #[cfg(any(feature = "tooling", debug_assertions))]
     if args.headless() {
         let scale = args.scale.unwrap_or(2.0);
-        crate::tooling::headless_window_spec(spec.app, spec.options, args, scale);
+        crate::tooling::started(crate::tooling::headless_window_spec(spec.app, spec.options, args, scale));
         return None;
     }
     let open_urls = crate::open_url::incoming::listen(&spec.app);
@@ -377,6 +382,10 @@ impl ApplicationHandler<WakeEvent> for Windows {
             }
         }
         crate::marks::loop_waits();
+        #[cfg(target_os = "macos")]
+        crate::native_menu::settle_standard_menus();
+        #[cfg(target_os = "macos")]
+        crate::platform::macos::launch::settle();
         crate::cursor::os::make_pending(event_loop);
         let mut animating = false;
         for host in self.hosts.iter_mut().flatten() {
@@ -395,6 +404,12 @@ impl ApplicationHandler<WakeEvent> for Windows {
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
         let _handling = crate::quit::handling();
         crate::marks::mark("loop.exiting");
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if self.display_error.is_none()
+            && let Ok(display) = winit::raw_window_handle::HasDisplayHandle::display_handle(event_loop)
+        {
+            self.display_error = crate::platform::layer_shell::display_error(display.as_raw());
+        }
         // Every quit ends here, so the windows still open run `App::on_quit` first, unless the
         // quit's hooks already ran (a Windows logoff, the last window closing).
         self.quit(event_loop, false, true);

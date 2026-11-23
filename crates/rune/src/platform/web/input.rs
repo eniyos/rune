@@ -313,7 +313,9 @@ impl Running {
             }
             Some("visibility") => {
                 let visible = event["visible"].as_bool().unwrap_or(false);
+                self.last_presented = None;
                 self.shared.set_visible(visible);
+                self.app.set_live_visible(visible);
                 if !visible {
                     crate::input::host_events::hide_reset(
                         self.app.rt_mut(),
@@ -343,12 +345,12 @@ impl Running {
                 return true;
             }
             Some(kind @ ("edit" | "selection" | "preedit")) => {
-                self.app.web_edit(event);
+                self.app.web_edit(event, &mut self.input.mirror);
                 // A typed edit is in the model and the page's field: the display's next frame
                 // draws it, one frame for every key and press that came before it.
                 if kind == "edit" && self.sync_live_edit() { return true; }
             }
-            Some("sync") => self.input.mirror.key.clear(), // Composition's final sync was deferred by the DOM.
+            Some("sync") => self.input.mirror.invalidate(), // Composition's final sync was deferred by the DOM.
             Some("paste") => {
                 let mut content = crate::ClipboardContent::new(event["text"].as_str().unwrap_or_default());
                 if let Some(html) = event["html"].as_str().filter(|html| !html.is_empty()) { content = content.with_html(html); }
@@ -358,6 +360,11 @@ impl Running {
             Some("secure") => {
                 if let serde_json::Value::String(text) = event["text"].take() {
                     self.app.rt_mut().web_secure(event["key"].as_str().unwrap_or_default(), text);
+                }
+            }
+            Some("secure_replace") => {
+                if let serde_json::Value::String(text) = event["text"].take() {
+                    self.app.web_secure_replace(event["key"].as_str().unwrap_or_default(), text);
                 }
             }
             Some("key") => activate = self.app.web_key(event),
@@ -436,8 +443,7 @@ impl Running {
                     (x, y, rt.page_window().0)
                 };
                 // The mirror's pointer is in window points; the canvas draws the band.
-                self.app.pointer_move(x, y + offset);
-                return true;
+                return self.app.observe_pointer(x, y + offset);
             }
             _ => {}
         }
@@ -459,8 +465,9 @@ impl Running {
             }
             WindowEvent::CursorMoved { position, .. } if !self.app.rt().touching() => {
                 let (x, y) = crate::input::host_events::physical_point(self.app.rt(), position.x, position.y);
-                self.app.pointer_move(x, y);
+                let changed = self.app.observe_pointer(x, y);
                 self.cursor.apply(window, self.app.rt().cursor(), true);
+                return changed;
             }
             WindowEvent::CursorLeft { .. } if !self.app.rt().touching() => {
                 self.app.rt_mut().pointer_leave();

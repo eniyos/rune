@@ -242,11 +242,14 @@ impl Summary {
     pub(crate) fn of_trace(text: &str) -> Option<Summary> {
         let mut lines = text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok());
         let header = lines.next()?;
-        let hz = header["hz"].as_f64().filter(|hz| *hz > 0.0).unwrap_or(60.0);
+        let mut hz = header["hz"].as_f64().filter(|hz| hz.is_finite() && *hz > 0.0).unwrap_or(60.0);
         let (mut frames, mut presented, mut skipped, mut timed) = (0, 0, 0, false);
         let (mut intervals, mut lags) = (Vec::new(), Vec::new());
         for frame in lines.filter(|l| l.get("t").is_some()) {
             frames += 1;
+            if let Some(rate) = frame["hz"].as_f64().filter(|hz| hz.is_finite() && *hz > 0.0) {
+                hz = rate;
+            }
             let Some(present) = frame.get("present_ms") else { continue };
             timed = true;
             let Some(present) = present.as_f64() else { skipped += 1; continue };
@@ -451,14 +454,28 @@ pub(crate) mod metal {
 
         fn hook(layer: Retained<AnyObject>, log: Arc<Log>) -> Option<Self> {
             let metal = AnyClass::get(c"CAMetalLayer")?;
-            let base = layer.class();
             // SAFETY: isKindOfClass: takes any class.
             let is_metal: bool = unsafe { msg_send![&*layer, isKindOfClass: metal] };
             if !is_metal { return None; }
-            let class = hooked_class(base)?;
+            Self::hook_instance(layer, log)
+        }
+
+        pub(super) fn hook_instance(layer: Retained<AnyObject>, log: Arc<Log>) -> Option<Self> {
+            // SAFETY: `layer` is a live ObjC object; never place a subclass above KVO's.
+            if unsafe { crate::platform::macos::kvo_observed(&layer) } { return None; }
+            let (base, class) = if crate::platform::macos::has_subclass(&layer, HOOKED_PREFIX.as_bytes()) {
+                let top = layer.class();
+                (original_class(top), top)
+            } else {
+                let base = layer.class();
+                let class = hooked_class(base)?;
+                (base, class)
+            };
             LAYERS.lock().unwrap().push(Hooked { addr: Retained::as_ptr(&layer) as usize, base, log });
-            // SAFETY: the subclass adds no ivars, so the instance layout is unchanged.
-            unsafe { AnyObject::set_class(&layer, class) };
+            if !std::ptr::eq(layer.class(), class) {
+                // SAFETY: the subclass adds no ivars, so the instance layout is unchanged.
+                unsafe { AnyObject::set_class(&layer, class) };
+            }
             Some(LayerHook { layer, base, class })
         }
     }

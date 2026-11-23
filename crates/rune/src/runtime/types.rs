@@ -129,6 +129,8 @@ pub(crate) struct Node {
     pub(super) width_leads: bool,
     /// Inside an `El::instant_changes` element, or one itself.
     pub(super) instant_changes: bool,
+    /// `El::animated_changes` set directly on this element: stops an ancestor's `instant_changes`.
+    pub(super) animated_changes: bool,
     pub(super) streaming: bool,
     pub(super) whole: bool,
     /// Inside an `El::inert` subtree (this element or an ancestor).
@@ -145,6 +147,8 @@ pub(crate) struct Node {
     /// `P_GROUP_REST` fades a dropped `El::group_opacity` to full: paint reads it until it lands.
     pub(super) group_fade: bool,
     pub(super) virtual_mount: bool,
+    /// Built from `El::virtualize` or `El::virtual_rows`.
+    pub(super) virtual_list: bool,
     /// `El::selection_group`.
     pub(super) selection_group: bool,
     pub(super) window_drag: crate::el::WindowDrag,
@@ -208,7 +212,8 @@ impl Node {
             time_scale: 1.0,
             in_row: RowLayout::Free,
             width_leads: false,
-            instant_changes: false,
+            instant_changes: old.instant_changes,
+            animated_changes: old.animated_changes,
             streaming: false,
             whole: false,
             inert: false,
@@ -218,6 +223,7 @@ impl Node {
             scale_track: old.scale_track,
             group_fade: old.group_fade,
             virtual_mount: false,
+            virtual_list: false,
             selection_group: false,
             window_drag: crate::el::WindowDrag::None,
             ime_cursor: false,
@@ -323,12 +329,21 @@ pub(super) struct Inh {
     /// How `scale` is changing, which decides how text rasterizes under it.
     pub(super) scale_motion: ScaleMotion,
     /// `(scale, anchor, anchor_to)` of the ancestors whose scales hold still from the root down,
-    /// as an app-wide zoom does, stopping at the first that moves. A flight keeps this part.
+    /// as an app-wide zoom does, stopping at the first that moves. Launches and text rasterizing
+    /// keep this part.
     pub(super) still: (f32, [f32; 2], [f32; 2]),
+    /// `(scale, anchor, anchor_to)` of the ancestors whose scales the app holds or drives (still
+    /// or live), stopping at the first whose scale animates on its own (an entrance, press,
+    /// static scale spring or cover). Matched flights land at this scale.
+    pub(super) held: (f32, [f32; 2], [f32; 2]),
+    /// True once an ancestor above had its own animating scale so descendants stop updating `held`.
+    pub(super) held_moving: bool,
     /// Inside an active `El::cache` scope: do not cull children against the window viewport.
     pub(super) in_cache: bool,
     /// Inside an elided or off-screen `El::cache` scope: skip primitive emission.
     pub(super) skip_paint: bool,
+    /// Inside an `El::anchored` overlay whose anchor could not be resolved: suppress paint and hits.
+    pub(super) anchor_hidden: bool,
     /// Ancestors' `El::rotate` layers, composed, as an index into `turn_scratch` plus one
     /// (0: none): where this subtree's device pixels land. An index keeps `Inh` small.
     pub(super) turn: u32,
@@ -369,7 +384,7 @@ impl Default for Inh {
             paint_clip: NO_CLIP, paint_fade: [0.0; 4], paint_fade_origin: NO_CLIP, rounded: None,
             scale: 1.0, anchor: [0.0; 2], anchor_to: [0.0; 2], blur: 0.0, dy: 0.0, dx: 0.0, cover: [0.0; 2], outer: None, mark: 0, group: 0.0, pressed: 0.0, press_to: None,
             hit_opacity: 1.0, group_rect: [f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::INFINITY],
-            scale_motion: ScaleMotion::Still, still: (1.0, [0.0; 2], [0.0; 2]), in_cache: false, skip_paint: false, turn: 0,
+            scale_motion: ScaleMotion::Still, still: (1.0, [0.0; 2], [0.0; 2]), held: (1.0, [0.0; 2], [0.0; 2]), held_moving: false, in_cache: false, skip_paint: false, anchor_hidden: false, turn: 0,
             snap: Default::default() }
     }
 }
@@ -578,6 +593,8 @@ pub(crate) struct TreeState {
     pub(in crate::runtime) has_raise: bool,
     /// Some element sets `El::paint_order`: its siblings paint out of tree order.
     pub(in crate::runtime) has_paint_order: bool,
+    /// Some element is `El::anchored` / `El::above`.
+    pub(in crate::runtime) has_above: bool,
     pub(in crate::runtime) has_cache: bool,
     /// Some picture sizes a side from its image's ratio (`pixel_aspect`).
     pub(in crate::runtime) has_pixel_aspect: bool,
@@ -601,6 +618,8 @@ pub(crate) struct TreeState {
     pub(crate) has_playground: bool,
     pub(in crate::runtime) exit_mask: exit_mask::Mask,
     key_index: key_index::KeyIndex,
+    /// Packed explicit piecewise-linear scroll-fade stops (`ScrollFade::stops`) for `Globals::flags[2..4]`.
+    pub(in crate::runtime) fade_stops: [f32; 2],
 }
 
 impl TreeState {
@@ -614,6 +633,7 @@ impl TreeState {
             has_dissolve: false,
             has_raise: false,
             has_paint_order: false,
+            has_above: false,
             has_cache: false,
             has_pixel_aspect: false,
             has_drawn_layout: false,
@@ -629,6 +649,7 @@ impl TreeState {
             app_root: 0,
             exit_mask: Default::default(),
             key_index: Default::default(),
+            fade_stops: [0.0; 2],
         }
     }
 
@@ -734,11 +755,6 @@ impl TreeState {
     #[inline]
     pub(super) fn key_path(&self, key: &str) -> Option<String> {
         self.nodes.iter().find(|n| n.key.as_deref() == Some(key)).map(|n| n.path.clone())
-    }
-
-    #[inline]
-    pub(super) fn index_of_key(&self, key: &str) -> Option<usize> {
-        self.nodes.iter().position(|n| n.key.as_deref() == Some(key))
     }
 
     #[inline]

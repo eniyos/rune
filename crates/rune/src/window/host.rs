@@ -29,6 +29,7 @@ pub(in crate::window) mod lifecycle;
 mod render;
 pub(in crate::window) mod shell_requests;
 pub(in crate::window) mod stepping;
+pub(in crate::window) mod window_script;
 
 #[cfg(test)]
 #[path = "host/frame_move_tests.rs"]
@@ -99,6 +100,8 @@ pub(in crate::window) struct Host {
     pub(in crate::window) trace: Option<crate::tooling::Trace>,
     pub(in crate::window) trace_start: Option<Instant>,
     pub(in crate::window) trace_frames: usize,
+    /// `--window-script`: the script this window replays (`window_script`).
+    pub(in crate::window) window_script: Option<window_script::WindowScript>,
     pub(in crate::window) meter: SurfaceMeter,
     pub(in crate::window) win: Option<Win>,
     pub(in crate::window) gpu: Option<(Arc<Gpu>, Renderer)>,
@@ -115,7 +118,11 @@ pub(in crate::window) struct Host {
     pub(in crate::window) files: FileDrop,
     pub(in crate::window) clipboard: crate::clipboard::Client,
     pub(in crate::window) secure_input: crate::input::secure_input::SecureInput,
-    pub(in crate::window) ime_allowed: bool,
+    pub(in crate::window) ime: crate::input::host_events::ImeSync,
+    /// While a new window's first frame is drawn: its text input starts once that frame is with
+    /// the window server, not inside it. On macOS, allowing the IME for a window of the app in
+    /// front (one started from the Dock) loads AppKit's text input services: about 15,000 µs.
+    pub(in crate::window) ime_waits: bool,
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(in crate::window) wayland: bool,
     /// The frame moving or jumping to where a handler asked (`stepping::FrameMove`).
@@ -333,6 +340,13 @@ impl Host {
         let present_log = args.trace.as_ref().map(|_| Arc::default());
         let has_comp = app.has_compositor();
         let meter = SurfaceMeter::new(native_handle.key(), native_handle.native.stats.clone());
+        // One window replays: the one `--window` names, else the first window the app opens.
+        let replays = args.window_script.is_some() && match args.window.as_deref() {
+            Some(key) => native_handle.key() == key,
+            None => window_script::claim_first(),
+        };
+        let window_script = replays.then(|| crate::tooling::read_window_script(&args).map(|events| window_script::WindowScript::new(events, crate::time::now()))).flatten();
+        if replays { println!("rune-script-window {}", native_handle.key()); }
         {
             let rt = app.rt_mut();
             rt.set_system_reduced_motion(crate::platform::preferences::reduced_motion());
@@ -349,7 +363,7 @@ impl Host {
             rt.transparent = options.transparent;
             rt.track_marks = has_comp;
             rt.wall_start = Some(crate::time::now());
-            rt.host.open_urls_natively = args.script.is_none() && args.trace.is_none() && args.frames.is_none();
+            rt.host.open_urls_natively = args.script.is_none() && args.window_script.is_none() && args.trace.is_none() && args.frames.is_none();
             rt.frame.set_record_events(false);
             rt.host.surface_stats = Some(meter.shared());
         }
@@ -404,12 +418,14 @@ impl Host {
             files: FileDrop::default(),
             clipboard,
             secure_input: Default::default(),
-            ime_allowed: false,
+            ime_waits: false,
+            ime: Default::default(),
             wayland,
             frame_move: None,
             trace: None,
             trace_start: None,
             trace_frames: 0,
+            window_script,
             meter,
             #[cfg(target_os = "macos")]
             present_log,

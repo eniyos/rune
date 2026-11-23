@@ -297,11 +297,8 @@ impl RuntimeCore {
     /// During `build`: the line boxes of node `i`'s links that have help, for border box
     /// `rect` and clipped to `clip` (points, x0 y0 x1 y1), after the first `seq` hits.
     pub(in crate::runtime) fn push_link_help_hits(&mut self, i: usize, rect: [f32; 4], clip: [f32; 4], seq: usize) {
-        let Some(t) = self.tree.nodes[i].text.as_ref() else { return };
-        if !t.cold.links.iter().any(|l| l.help.is_some()) { return; }
         let id = self.tree.nodes[i].id;
-        for (k, r) in self.link_boxes(i, rect) {
-            if self.tree.nodes[i].text.as_ref().and_then(|t| t.cold.links.get(k)).is_none_or(|l| l.help.is_none()) { continue; }
+        for (k, r) in self.link_boxes_matching(i, rect, |l| l.help.is_some()) {
             let c = [r[0].max(clip[0]), r[1].max(clip[1]), r[2].min(clip[2]), r[3].min(clip[3])];
             self.hit.push_help_hit(id, c, seq, Some(k));
         }
@@ -330,12 +327,6 @@ impl RuntimeCore {
         }
     }
 
-    /// The help element under (x, y): the topmost one, unless something interactive drawn over
-    /// it (not inside it) is there too.
-    fn help_at(&self, x: f32, y: f32) -> Option<(usize, Option<usize>)> {
-        self.help_under(x, y).filter(|u| u.2).map(|(h, link, _)| (h, link))
-    }
-
     /// The topmost help element under (x, y), and whether the pointer reaches it: not behind a
     /// modal, and nothing interactive drawn over it (not inside it) is there too.
     fn help_under(&self, x: f32, y: f32) -> Option<(usize, Option<usize>, bool)> {
@@ -349,13 +340,22 @@ impl RuntimeCore {
         Some((h, link, self.allowed(h) && !covered))
     }
 
-    /// Whether moving the pointer to (x, y) changes the help element under it, so a host that
-    /// skips frames for unchanged pixels still starts or ends a tooltip's wait.
-    pub(in crate::runtime) fn help_target_changes(&self, x: f32, y: f32) -> bool {
-        let target = self.pointer.help.state.target();
-        if self.pointer.native_help(self.commit.defaults.help.is_some()) || !self.hit.has_help_hits() && target.is_none() { return false; }
-        let at = self.help_at(x, y).map(|(i, k)| (self.tree.nodes[i].path.as_str(), k));
-        at != target.map(|t| (t.path.as_str(), t.link))
+    /// Whether the current pointer position changes what the tooltip machine sees, so a host
+    /// that skips frames for unchanged pixels still starts, hides or switches a tooltip.
+    pub(in crate::runtime) fn help_changes(&self) -> bool {
+        let tip = &self.pointer.help.state;
+        if self.pointer.native_help(self.commit.defaults.help.is_some())
+            || (!self.hit.has_help_hits() && tip.target().is_none())
+        {
+            return false;
+        }
+        match self.help_over().0 {
+            Over::Forced(at) => !matches!(tip, Tip::Open { target, .. } if *target == at),
+            Over::Focused(at) | Over::Help(at) => tip.target() != Some(&at),
+            Over::Covered(at) if tip.target() == Some(&at) => !matches!(tip, Tip::Suppressed { .. }),
+            Over::Away if matches!(tip, Tip::Suppressed { .. }) => false,
+            Over::Away | Over::Nothing | Over::Covered(_) => tip.target().is_some(),
+        }
     }
 
     /// What the pointer is over for the tooltip, and the node of a help element it reaches.
@@ -457,15 +457,23 @@ impl RuntimeCore {
             let node = under.or_else(|| self.hover_live(&target.path));
             if let Some(i) = node && let Some(text) = self.help_text(i, link).cloned() {
                 let e = self.drawn_box(i);
-                let anchor = link.and_then(|k| self.link_boxes(i, e).into_iter().filter(|(j, _)| *j == k).map(|(_, r)| r)
+                let anchor = link.and_then(|k| self.link_boxes_for(i, k, e).into_iter().map(|(_, r)| r)
                     .reduce(|u, r| [u[0].min(r[0]), u[1].min(r[1]), u[2].max(r[2]), u[3].max(r[3])]));
-                let side = link.is_none().then(|| self.tree.nodes[i].cold.get().and_then(|c| c.help_side)).flatten();
-                let t = if motion && look.fade[0] > 0.0 { ((self.clock - since) / look.fade[0]) as f32 } else { 1.0 };
-                let e_in = rune_motion::Easing::EASE_OUT.eval(t.clamp(0.0, 1.0));
-                let d = Drawn { text, anchor: anchor.unwrap_or(e), side, alpha: e_in, scale: look.fade_scale + (1.0 - look.fade_scale) * e_in };
-                let [x, y, w, h] = self.draw_tooltip(&d);
-                self.pointer.help.tip = Some((crate::el::help_words(&d.text).into_owned(), [x, y, w, h]));
-                self.pointer.help.drawn = Some(d);
+                let box_rect = anchor.unwrap_or(e);
+                if box_rect[2] <= box_rect[0] && box_rect[3] <= box_rect[1] {
+                    let path = self.tree.nodes[i].path.clone();
+                    if self.paint.unresolved_anchor_warnings.insert((path.clone(), "<tooltip>".to_owned())) {
+                        eprintln!("rune: tooltip on {path:?} skipped because its anchor rect is empty (never drawn at origin)");
+                    }
+                } else {
+                    let side = link.is_none().then(|| self.tree.nodes[i].cold.get().and_then(|c| c.help_side)).flatten();
+                    let t = if motion && look.fade[0] > 0.0 { ((self.clock - since) / look.fade[0]) as f32 } else { 1.0 };
+                    let e_in = rune_motion::Easing::EASE_OUT.eval(t.clamp(0.0, 1.0));
+                    let d = Drawn { text, anchor: box_rect, side, alpha: e_in, scale: look.fade_scale + (1.0 - look.fade_scale) * e_in };
+                    let [x, y, w, h] = self.draw_tooltip(&d);
+                    self.pointer.help.tip = Some((crate::el::help_words(&d.text).into_owned(), [x, y, w, h]));
+                    self.pointer.help.drawn = Some(d);
+                }
             }
         }
         if self.pointer.tooltip_fading(self.clock, look.fade) { self.schedule_wakes([std::time::Duration::ZERO]); }
@@ -478,6 +486,7 @@ impl RuntimeCore {
     /// of the edge that faces its box.
     fn draw_tooltip(&mut self, d: &Drawn) -> [f32; 4] {
         let e = d.anchor;
+        debug_assert!(e[2] > e[0] || e[3] > e[1], "draw_tooltip called with empty anchor rect {e:?}");
         let s = self.env.scale;
         let look = self.help_look();
         let key = look.key;
@@ -508,6 +517,15 @@ impl RuntimeCore {
         let w = rows.iter().map(|r| r.tw + r.keys_w).fold(0.0, f32::max) + 2.0 * pad_x;
         let h = rows.iter().map(|r| r.ch).sum::<f32>() + gaps + 2.0 * pad_y;
         let [below, over] = look.gap;
+        // On a line (`HelpLook::sit_on_line`), how far under its place the tooltip sits: the
+        // line's baseline less its first row's, where the row centres its words beside keycaps.
+        let drop = look.line.and_then(|strut| {
+            let first = rows.first().filter(|r| r.words)?;
+            let line = self.text.layout_rich(" ", &[], strut, s, None).lines().next()?.metrics().baseline;
+            let words = first.layout.lines().next()?.metrics().baseline;
+            let base = pad_y * s + ((first.ch - first.th) * 0.5 * s).round() + words;
+            Some(((line - base) / s).max(0.0))
+        }).unwrap_or(0.0);
         let (x, y) = match d.side {
             // Beside it, centred down it: right of it unless only the left has room, and the
             // other way round (`placement="right"` / `"left"`).
@@ -519,7 +537,7 @@ impl RuntimeCore {
                 (x, (e[1] + e[3] - h) * 0.5)
             }
             side => {
-                let mut y = e[3] + below;
+                let mut y = e[3] + below + drop;
                 if side == Some(crate::Side::Top) && e[1] - over - h >= margin {
                     y = e[1] - over - h;
                 } else if y + h > vh - margin && e[1] - below - h >= margin {

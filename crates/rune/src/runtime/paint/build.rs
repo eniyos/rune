@@ -2,7 +2,7 @@
 use super::*;
 
 mod layers;
-mod pose;
+pub(in crate::runtime) mod pose;
 mod primitives;
 
 impl RuntimeCore {
@@ -109,7 +109,7 @@ impl RuntimeCore {
             let node_parent = self.tree.nodes[i].parent;
             // A flight paints outside every ancestor's layer, above the whole window.
             let lift = flying && self.motion.flying.iter().any(|f| f.0 == node_id);
-            let raised = self.tree.nodes[i].vis_flags.raise() && !lift;
+            let raised = (self.tree.nodes[i].vis_flags.raise() || (tree_order && self.paint.is_lifted_anchor(i))) && !lift;
             if lift || raised {
                 self.paint.close_all_layers(&self.tree.nodes, &mut self.instances, &mut self.surfaces, &mut self.marks, self.track_marks, &mut self.text, self.commit.commit_gen(), &mut layers, &mut active_cache, &mut glyph_count);
             }
@@ -119,6 +119,13 @@ impl RuntimeCore {
             let n = &self.tree.nodes[i];
             let Some(p) = self.scene.presented(n.id) else { continue };
             let mut pinh = n.parent.map_or_else(|| self.root_inh(), |pr| self.paint.inh_scratch[pr]);
+            if pinh.anchor_hidden {
+                self.paint.inh_scratch[i] = pinh;
+                self.paint.drawn[i] = [0.0; 4];
+                self.paint.seen[i] = false;
+                self.keep_painted(i, false);
+                continue;
+            }
             // A stuck header's title (its first child) fades as the next header comes up.
             if pinh.first_fade < 1.0 && n.parent.is_some_and(|pr| pr + 1 == i) {
                 pinh.opacity *= pinh.first_fade;
@@ -136,10 +143,30 @@ impl RuntimeCore {
             }
             pinh.dy += self.paint.row_dy[i];
             pinh.snap.grow(self.paint.row_dy[i]);
-            if let Some(a) = &n.above
-                && let Some(j) = anchor_index(&self.tree.nodes, i, a)
-            {
-                self.anchored_inh(i, j, a, &p, &mut pinh);
+            if let Some(a) = self.tree.nodes[i].above.clone() {
+                if let Some(j) = anchor_index_live(&self.tree.nodes, i, &a, |idx| self.subtree_exiting(idx)) {
+                    let saved = self.anchored_inh(i, j, &a, &p, &mut pinh);
+                    self.paint.last_anchor_targets.insert(node_id, saved);
+                } else if self.subtree_exiting(i)
+                    && let Some((target, k)) = self.paint.last_anchor_targets.get(&node_id).copied()
+                {
+                    self.anchored_inh_at(i, &a, target, k, ScaleMotion::Still, &p, &mut pinh);
+                } else {
+                    // Never draw an anchored overlay at (0, 0) when its anchor cannot be resolved.
+                    let path = self.tree.nodes[i].path.clone();
+                    if self.paint.unresolved_anchor_warnings.insert((path.clone(), a.key.clone())) {
+                        eprintln!("rune: anchored overlay {path:?} could not resolve anchor {:?}; suppressed (never drawn at origin)", a.key);
+                    }
+                    pinh.anchor_hidden = true;
+                    pinh.opacity = 0.0;
+                    pinh.paint_opacity = 0.0;
+                    pinh.hit_opacity = 0.0;
+                    self.paint.inh_scratch[i] = pinh;
+                    self.paint.drawn[i] = [0.0; 4];
+                    self.paint.seen[i] = false;
+                    self.keep_painted(i, false);
+                    continue;
+                }
             }
             let kids_fade = if self.tree.has_sticky {
                 self.apply_sticky_inh(i, node_parent, &p, &mut pinh)
@@ -153,9 +180,11 @@ impl RuntimeCore {
             if raised {
                 self.paint.reopen_raised_layers(&self.tree.nodes, &self.scene, &mut self.instances, self.surfaces.len(), node_parent, &mut pinh, &mut layers, s);
             }
-            if lift {
-                self.motion.lift_flight_inh(&self.paint, &self.scene, self.commit.commit_gen(), node_id, node_parent, &mut pinh);
-            }
+            let flight_dest = if lift {
+                self.motion.lift_flight_inh(&self.tree.nodes, &self.paint, &self.scene, self.commit.commit_gen(), node_id, node_parent, &mut pinh)
+            } else {
+                None
+            };
             let n = &self.tree.nodes[i];
             let mark = if n.vis.mark != 0 { n.vis.mark } else { pinh.mark };
             let mut own = p.opacity;
@@ -213,10 +242,14 @@ impl RuntimeCore {
                 pose::step_static_scale(&mut self.paint.static_scales, &mut self.paint.scale_frame, n.id, tracked_scale, self.t, self.settled, has_live_scale)
             } else { false };
             let store = self.scene.store();
-            let scale_animating = store.is_animating(n.id, prop::SCALE) || store.is_animating(n.id, prop::PRESENCE)
-                || (has_press_scale && store.is_animating(n.id, P_PRESS_SCALE))
+            let own_scale_anim = (has_press_scale && store.is_animating(n.id, P_PRESS_SCALE))
                 || (n.scale_track && store.is_animating(n.id, P_SCALE))
                 || sequence.is_some_and(|l| !self.reduced_motion && l.active(lnow));
+            let presence_anim = store.is_animating(n.id, prop::PRESENCE);
+            let scale_animating = store.is_animating(n.id, prop::SCALE) || presence_anim || own_scale_anim;
+            let presence_scales = presence_anim
+                && n.transition.as_deref().is_some_and(|t| t.insertion.scale != 1.0 || t.removal.scale != 1.0);
+            let own_scale_moving = presence_scales || own_scale_anim;
             let scale_motion = pinh.scale_motion.max(
                 if !has_live_scale && (scale_animating || scale_settling) {
                     ScaleMotion::Moving
@@ -254,7 +287,9 @@ impl RuntimeCore {
                 pose::update_sticky_frame(&mut self.scroll.sticky_frame, i, n, raw_edges);
             }
             // A product of 1 (0.5 inside 2.0) can still move the box.
-            let mut rect_pt = if (sc - 1.0).abs() > 1e-5 || anchor != anchor_to {
+            let mut rect_pt = if let Some(dest) = flight_dest {
+                pose::flight_frame(&self.scene, n, &p, own_sc, self.paint.row_h[i], dest)
+            } else if (sc - 1.0).abs() > 1e-5 || anchor != anchor_to {
                 [
                     anchor_to[0] + (raw_edges[0] - anchor[0]) * sc,
                     anchor_to[1] + (raw_edges[1] - anchor[1]) * sc,
@@ -275,7 +310,7 @@ impl RuntimeCore {
             // A matched flight scales its laid-out content uniformly to cover the moving rect,
             // centred: `k` and the centring offset in points. A launch flies at its own size.
             let cover = if lift && n.local.w > 0.0 && n.local.h > 0.0 {
-                pose::flight_cover(self.motion.launches(), node_id, n, rect_pt)
+                pose::flight_cover(self.motion.launches(), node_id, n, rect_pt, sc)
             } else { None };
             let r_exact = rect_pt.map(snap_px);
             // A node the visibility test below culls paints nothing, and any clip it hands down is
@@ -354,7 +389,7 @@ impl RuntimeCore {
 
             if !p.mask.is_none() {
                 let ins = p.mask.inset.0.map(|v| v * sc * s);
-                let fea = p.mask.feather.0.map(|v| v * sc * s);
+                let fea = p.mask.feather.0.map(|v| (v * sc * s).clamp(-65504.0, 65504.0));
                 clip = [
                     (r[0] + ins[0]).max(clip[0]),
                     (r[1] + ins[1]).max(clip[1]),
@@ -479,6 +514,7 @@ impl RuntimeCore {
                 visible
             };
             let painted = !skip_paint && effective_opacity > 0.001 && o > 0.001 && paint_visible;
+            debug_assert!(!pinh.anchor_hidden, "anchored overlay {:?} reached paint without a resolved anchor", n.path);
             // Unpulled out of sight, a video still counts, so a scroll across a clip edge doesn't commit.
             if !painted && let Some((surface, _)) = &n.vis.surface { video_signature = crate::video::fold_unpulled(video_signature, surface); }
             self.paint.node_animated_icon = false;
@@ -629,7 +665,9 @@ impl RuntimeCore {
                 cover: cover_offset, outer, mark, group, pressed, press_to,
                 hit_opacity: hit_opacity * kids_fade, group_rect,
                 scale_motion, still: if scale_motion == ScaleMotion::Still { (scale, anchor, anchor_to) } else { pinh.still },
-                in_cache, skip_paint, turn: turn_index,
+                held_moving: pinh.held_moving || own_scale_moving || cover.is_some(),
+                held: if !(pinh.held_moving || own_scale_moving || cover.is_some()) { (scale, anchor, anchor_to) } else { pinh.held },
+                in_cache, skip_paint, anchor_hidden: false, turn: turn_index,
                 snap: pixel_snap::Inherit { off: snap_off, steps, shifted: pinh.snap.shifted || n.vis.offset != [0.0; 2], layer: if cover.is_some() { 0 } else { snap_layer }, parent: snap_rest.filter(|_| cover.is_none() && snap.rigid == pinh.snap.rigid && pixel_snap::frames(&n.vis)), ..snap } };
             // Shown only under its group's hover, it takes presses where the pointer hovers the
             // group: a press in the same frame as the move that reveals it finds it, as a page's
@@ -643,6 +681,9 @@ impl RuntimeCore {
         }
         if !self.paint.icon_anim_mounts.is_empty() {
             self.paint.icon_anim_mounts.retain(|(id, _), _| self.tree.node_index.contains_key(id));
+        }
+        if !self.paint.last_anchor_targets.is_empty() {
+            self.paint.last_anchor_targets.retain(|id, _| self.tree.node_index.contains_key(id));
         }
         self.keep_close(None, &mut layers, &mut active_cache, &mut glyph_count);
         self.keep_end();

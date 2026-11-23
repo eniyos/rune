@@ -42,39 +42,82 @@ fn ramp(d: f32, fade: f32) -> f32 {
     if fade < 0.0 { x } else { x * x * (3.0 - 2.0 * x) }
 }
 
-/// An instance's clip, decoded once: `clip_alpha`'s inputs.
+/// `ramp_stops`: matches `clip.wgsl`'s `ramp_stops`.
+fn ramp_stops(d: f32, fade: f32, ts: [f32; 4], ys: [f32; 4]) -> f32 {
+    if fade == 0.0 { return clamp01(d + 0.5); }
+    let w = fade.abs();
+    if d >= w { return 1.0; }
+    if d <= 0.0 { return 0.0; }
+    let x = d / w;
+    let (mut px, mut py) = (0.0f32, 0.0f32);
+    for k in 0..4 {
+        let (nx, ny) = (ts[k], ys[k]);
+        if x <= nx {
+            let span = nx - px;
+            return if span > 1e-6 { py + (ny - py) * ((x - px) / span) } else { ny };
+        }
+        px = nx;
+        py = ny;
+    }
+    1.0
+}
+
+/// An instance's clip, decoded once: `clip_alpha_stops`'s inputs.
 #[derive(Clone, Copy)]
 pub(super) struct Clip {
     pub rect: [f32; 4],
     fade: [f32; 4],
     offset: [f32; 4],
+    is_stops: [bool; 4],
+    ts: [f32; 4],
+    ys: [f32; 4],
     pub radii: Option<[f32; 4]>,
 }
 
 impl Clip {
     pub(super) fn of(i: &Instance) -> Clip {
+        Self::of_stops(i, [0.0; 2])
+    }
+
+    pub(super) fn of_stops(i: &Instance, stops: [f32; 2]) -> Clip {
         let f = i.fade;
         let half = |w: u32, hi: bool| half::f16::from_bits((if hi { w >> 16 } else { w }) as u16).to_f32();
+        let (ts, ys) = if (f[2] & 0x8080_8080) != 0 {
+            let lo = (stops[0] + 0.5) as u32;
+            let hi = (stops[1] + 0.5) as u32;
+            (
+                [(lo & 0xFF) as f32 * (1.0 / 200.0), ((lo >> 16) & 0xFF) as f32 * (1.0 / 200.0), ((hi >> 8) & 0xFF) as f32 * (1.0 / 200.0), 1.0],
+                [((lo >> 8) & 0xFF) as f32 * (1.0 / 200.0), (hi & 0xFF) as f32 * (1.0 / 200.0), ((hi >> 16) & 0xFF) as f32 * (1.0 / 200.0), 1.0],
+            )
+        } else {
+            ([0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0])
+        };
         Clip {
             rect: i.clip,
             fade: [half(f[0], false), half(f[0], true), half(f[1], false), half(f[1], true)],
-            // `unpack4x8unorm`.
-            offset: std::array::from_fn(|e| ((f[2] >> (e * 8)) & 255) as f32 / 255.0),
+            offset: std::array::from_fn(|e| ((f[2] >> (e * 8)) & 0x7f) as f32 / 127.0),
+            is_stops: std::array::from_fn(|e| ((f[2] >> (e * 8)) & 0x80) != 0),
+            ts,
+            ys,
             radii: (f[3] != 0).then(|| unpack_clip_radii(f[3])),
         }
     }
 
-    /// `clip_alpha`.
+    /// `clip_alpha_stops`.
     pub(super) fn alpha(&self, p: [f32; 2]) -> f32 {
         let c = self.rect;
         let hard = [p[0] - c[0], p[1] - c[1], c[2] - p[0], c[3] - p[1]];
         let mut alpha = 1.0;
         for edge in 0..4 {
-            let (f, o) = (self.fade[edge], self.offset[edge]);
+            let (f, o, is_stops) = (self.fade[edge], self.offset[edge], self.is_stops[edge]);
             let a = if o >= 1.0 {
                 ramp(hard[edge], 0.0)
             } else if o > 0.0 {
-                ramp(hard[edge], 0.0).min(ramp(hard[edge] + o * f.abs(), f))
+                let shifted = hard[edge] + o * f.abs();
+                let r = if is_stops { ramp_stops(shifted, f, self.ts, self.ys) } else { ramp(shifted, f) };
+                ramp(hard[edge], 0.0).min(r)
+            } else if is_stops {
+                ramp_stops(hard[edge], f, self.ts, self.ys)
             } else {
                 ramp(hard[edge], f)
             };
@@ -109,44 +152,55 @@ fn erf(x: f32) -> f32 {
     s - s / (r * r)
 }
 
-fn shadow_x(x: f32, y: f32, sigma: f32, corner: f32, half: [f32; 2]) -> f32 {
-    let delta = (half[1] - corner - y.abs()).min(0.0);
-    let curved = half[0] - corner + (corner * corner - delta * delta).max(0.0).sqrt();
+fn shadow_radii(i: &Instance, half: [f32; 2]) -> [f32; 4] {
+    let m = half[0].min(half[1]);
+    let raw = if i.uv[2] > 0.0 { [i.radii[0]; 4] } else { i.radii };
+    raw.map(|r| r.abs().min(m))
+}
+
+fn shadow_x(x: f32, y: f32, sigma: f32, radii: [f32; 4], half: [f32; 2]) -> f32 {
+    let [cl, cr] = if y > 0.0 { [radii[3], radii[2]] } else { [radii[0], radii[1]] };
+    let dl = (half[1] - cl - y.abs()).min(0.0);
+    let dr = (half[1] - cr - y.abs()).min(0.0);
+    let left = half[0] - cl + (cl * cl - dl * dl).max(0.0).sqrt();
+    let right = half[0] - cr + (cr * cr - dr * dr).max(0.0).sqrt();
     let k = 0.5f32.sqrt() / sigma;
-    (0.5 + 0.5 * erf((x + curved) * k)) - (0.5 + 0.5 * erf((x - curved) * k))
+    (0.5 + 0.5 * erf((x + left) * k)) - (0.5 + 0.5 * erf((x - right) * k))
 }
 
 /// shader.wgsl's `SHADOW_INSIDE`.
 pub(super) use shader_consts::SHADOW_INSIDE;
 
 /// `shadow`.
-fn shadow(p: [f32; 2], half: [f32; 2], sigma: f32, corner: f32) -> f32 {
+fn shadow(p: [f32; 2], half: [f32; 2], sigma: f32, radii: [f32; 4]) -> f32 {
+    let corner = radii[0].max(radii[1]).max(radii[2]).max(radii[3]);
     if p[0].abs() <= half[0] - shader_consts::SHADOW_INSIDE_SIGMA * sigma
         && p[1].abs() <= half[1] - corner - shader_consts::SHADOW_INSIDE_SIGMA * sigma
     {
         return SHADOW_INSIDE;
     }
     let (lo, hi) = (p[1] - half[1], p[1] + half[1]);
+    if !(lo <= hi) || !lo.is_finite() || !hi.is_finite() { return 0.0; }
     let start = (-shader_consts::SHADOW_WINDOW_SIGMA * sigma).clamp(lo, hi);
     let end = (shader_consts::SHADOW_WINDOW_SIGMA * sigma).clamp(lo, hi);
     let step = (end - start) / shader_consts::SHADOW_SAMPLES as f32;
     let mut y = start + step * 0.5;
     let mut v = 0.0;
     for _ in 0..shader_consts::SHADOW_SAMPLES {
-        v += shadow_x(p[0], p[1] - y, sigma, corner, half) * gaussian(y, sigma) * step;
+        v += shadow_x(p[0], p[1] - y, sigma, radii, half) * gaussian(y, sigma) * step;
         y += step;
     }
     v
 }
 
 /// `shadow` for one row of a `KIND_SHADOW`: what its four y samples take from the row alone
-/// (each sample's curved half width and Gaussian weight), so a pixel costs only its erf pairs.
-/// The arithmetic and its order are `shadow`'s.
+/// (each sample's left and right curved extents and Gaussian weight), so a pixel costs only its
+/// erf pairs. The arithmetic and its order are `shadow`'s.
 pub(super) struct ShadowRow {
     /// The row's centre relative to the shadow's centre.
     y: f32,
     py: f32,
-    samples: [(f32, f32); shader_consts::SHADOW_SAMPLES],
+    samples: [(f32, f32, f32); shader_consts::SHADOW_SAMPLES],
     step: f32,
     half: [f32; 2],
     sigma: f32,
@@ -159,9 +213,13 @@ pub(super) struct ShadowRow {
 
 impl ShadowRow {
     /// What a pixel's sum depends on besides its `x`: rows that share it share every column's.
-    pub(super) fn key(&self) -> [u32; shader_consts::SHADOW_SAMPLES * 2 + 1] {
-        let mut k = [self.step.to_bits(); shader_consts::SHADOW_SAMPLES * 2 + 1];
-        for (n, (c, g)) in self.samples.iter().enumerate() { k[n * 2] = c.to_bits(); k[n * 2 + 1] = g.to_bits(); }
+    pub(super) fn key(&self) -> [u32; shader_consts::SHADOW_SAMPLES * 3 + 1] {
+        let mut k = [self.step.to_bits(); shader_consts::SHADOW_SAMPLES * 3 + 1];
+        for (n, &(l, r, g)) in self.samples.iter().enumerate() {
+            k[n * 3] = l.to_bits();
+            k[n * 3 + 1] = r.to_bits();
+            k[n * 3 + 2] = g.to_bits();
+        }
         k
     }
 
@@ -183,10 +241,11 @@ impl ShadowRow {
 
     /// The erf sum at `x` (from the shadow's centre), outside the interior.
     pub(super) fn sum(&self, x: f32) -> f32 {
+        if self.step == 0.0 { return 0.0; }
         if x.abs() <= self.mid.0 { return self.mid.1; }
         let mut v = 0.0;
-        for &(curved, g) in &self.samples {
-            let sx = (0.5 + 0.5 * erf((x + curved) * self.k)) - (0.5 + 0.5 * erf((x - curved) * self.k));
+        for &(left, right, g) in &self.samples {
+            let sx = (0.5 + 0.5 * erf((x + left) * self.k)) - (0.5 + 0.5 * erf((x - right) * self.k));
             v += sx * g * self.step;
         }
         v
@@ -197,8 +256,12 @@ pub(super) fn shadow_row(i: &Instance, py: f32) -> ShadowRow {
     let half = [i.rect[2] * 0.5, i.rect[3] * 0.5];
     let y = py - (i.rect[1] + half[1]);
     let sigma = i.params[2].max(shader_consts::SHADOW_MIN_SIGMA);
-    let corner = i.radii[0].abs().min(half[0].min(half[1]));
+    let radii = shadow_radii(i, half);
+    let corner = radii[0].max(radii[1]).max(radii[2]).max(radii[3]);
     let (lo, hi) = (y - half[1], y + half[1]);
+    if !(lo <= hi) || !lo.is_finite() || !hi.is_finite() {
+        return ShadowRow { y, py, samples: [(0.0, 0.0, 0.0); shader_consts::SHADOW_SAMPLES], step: 0.0, half: [0.0, 0.0], sigma, corner: 0.0, k: 0.0, mid: (-1.0, 0.0) };
+    }
     let start = (-shader_consts::SHADOW_WINDOW_SIGMA * sigma).clamp(lo, hi);
     let end = (shader_consts::SHADOW_WINDOW_SIGMA * sigma).clamp(lo, hi);
     let step = (end - start) / shader_consts::SHADOW_SAMPLES as f32;
@@ -206,15 +269,20 @@ pub(super) fn shadow_row(i: &Instance, py: f32) -> ShadowRow {
     let samples = std::array::from_fn(|_| {
         let at = s;
         s += step;
-        let delta = (half[1] - corner - (y - at).abs()).min(0.0);
-        (half[0] - corner + (corner * corner - delta * delta).max(0.0).sqrt(), gaussian(at, sigma))
+        let ry = y - at;
+        let [cl, cr] = if ry > 0.0 { [radii[3], radii[2]] } else { [radii[0], radii[1]] };
+        let dl = (half[1] - cl - ry.abs()).min(0.0);
+        let dr = (half[1] - cr - ry.abs()).min(0.0);
+        let left = half[0] - cl + (cl * cl - dl * dl).max(0.0).sqrt();
+        let right = half[0] - cr + (cr * cr - dr * dr).max(0.0).sqrt();
+        (left, right, gaussian(at, sigma))
     });
     let k = 0.5f32.sqrt() / sigma;
-    // `erf` is exactly ±1 from 5.5 out; `(x ± curved) * k` must reach it for every sample.
-    let reach = samples.iter().map(|s| s.0).fold(f32::INFINITY, f32::min) - 5.5 / k;
+    // `erf` is exactly ±1 from 5.5 out; `(x + left) * k` and `(x - right) * k` must reach it for every sample.
+    let reach = samples.iter().map(|s| s.0.min(s.1)).fold(f32::INFINITY, f32::min) - 5.5 / k;
     let mut v = 0.0;
-    for &(_, g) in &samples { v += 1.0 * g * step; }
-    // Shrunk by a part in a million, so rounding in `x ± curved` can't land a pixel short of 5.5.
+    for &(_, _, g) in &samples { v += 1.0 * g * step; }
+    // Shrunk by a part in a million, so rounding in `x ± reach` can't land a pixel short of 5.5.
     let mid = (reach - reach.abs() * 1e-6 - 1e-3, v);
     ShadowRow { y, py, samples, step, half, sigma, corner, k, mid }
 }
@@ -236,6 +304,7 @@ fn segment(p: [f32; 2], a: [f32; 2], b: [f32; 2], hw: f32, round: bool) -> f32 {
     let weight = (hw * 2.0).min(1.0);
     let ab = [b[0] - a[0], b[1] - a[1]];
     let len = (ab[0] * ab[0] + ab[1] * ab[1]).sqrt();
+    if !len.is_finite() { return 0.0; }
     let ap = [p[0] - a[0], p[1] - a[1]];
     let d = if len < shader_consts::SEGMENT_MIN_LEN {
         if !round { return 0.0; }
@@ -405,8 +474,7 @@ pub(super) fn boxes(i: &Instance, kind: Kind, p: [f32; 2]) -> [f32; 4] {
         }
         Kind::Shadow => {
             let sigma = i.params[2].max(shader_consts::SHADOW_MIN_SIGMA);
-            let corner = i.radii[0].abs().min(half[0].min(half[1]));
-            let mut cov = shadow(q, half, sigma, corner);
+            let mut cov = shadow(q, half, sigma, shadow_radii(i, half));
             if i.uv[2] > 0.0 {
                 let hole = [i.uv[2] * 0.5, i.uv[3] * 0.5];
                 let at = [p[0] - (i.rect[0] + i.uv[0] + hole[0]), p[1] - (i.rect[1] + i.uv[1] + hole[1])];
@@ -421,7 +489,8 @@ pub(super) fn boxes(i: &Instance, kind: Kind, p: [f32; 2]) -> [f32; 4] {
             let lit = if i.params[2] < shader_consts::INSET_SHARP_SIGMA {
                 box_cov(qs, ih, i.radii.map(|r| (r.abs() - spread).max(0.0).copysign(r)))
             } else {
-                shadow(qs, ih, i.params[2], (i.radii[0].abs() - spread).min(ih[0].min(ih[1])).max(0.0))
+                let m = ih[0].min(ih[1]);
+                shadow(qs, ih, i.params[2], i.radii.map(|r| (r.abs() - spread).min(m).max(0.0)))
             };
             scale4(i.fill, box_cov(q, half, i.radii) * (1.0 - clamp01(lit)))
         }
@@ -491,7 +560,12 @@ pub(super) fn linear_row_outside(i: &Instance, py: f32, x0: f32, x1: f32) -> boo
 /// `image_texel` in an sRGB-blending frame: one texel of an `Rgba8UnormSrgb` image page,
 /// premultiplied in sRGB encoding. The page holds straight alpha unless `premultiplied`.
 pub(super) fn image_texel(page: &super::Image<'_>, t: [i32; 2], premultiplied: bool) -> [f32; 4] {
-    let at = (t[1] as usize * page.width as usize + t[0] as usize) * 4;
+    if t[0] < 0 || t[1] < 0 || t[0] as u32 >= page.width { return [0.0; 4]; }
+    let Some(at) = (t[1] as usize)
+        .checked_mul(page.width as usize)
+        .and_then(|row| row.checked_add(t[0] as usize))
+        .and_then(|px| px.checked_mul(4))
+    else { return [0.0; 4] };
     let Some(c) = page.data.get(at..at + 4) else { return [0.0; 4] };
     let a = c[3] as f32 / 255.0;
     if a <= 0.0 { return [0.0; 4]; }
@@ -519,17 +593,36 @@ fn srgb_tables() -> &'static ([f32; 256], [f32; 256]) {
 
 /// `KIND_IMAGE` at pixel centre `p`: bilinear, clamped to the image's own texels.
 pub(super) fn image(i: &Instance, page: &super::Image<'_>, p: [f32; 2]) -> [f32; 4] {
+    if !(i.rect[2] > 0.0 && i.rect[3] > 0.0 && i.uv[2] > 0.0 && i.uv[3] > 0.0)
+        || !i.rect[2].is_finite() || !i.rect[3].is_finite()
+        || !i.uv[0].is_finite() || !i.uv[1].is_finite()
+        || !i.uv[2].is_finite() || !i.uv[3].is_finite()
+    {
+        return [0.0; 4];
+    }
     let half = [i.rect[2] * 0.5, i.rect[3] * 0.5];
     let d = sd_rounded([p[0] - i.rect[0] - half[0], p[1] - i.rect[1] - half[1]], half, i.radii);
     let local = [(p[0] - i.rect[0]) * i.uv[2] / i.rect[2] - 0.5, (p[1] - i.rect[1]) * i.uv[3] / i.rect[3] - 0.5];
+    if !local[0].is_finite() || !local[1].is_finite() { return [0.0; 4]; }
     let lo = [i.uv[0] as i32, i.uv[1] as i32];
-    let hi = [lo[0] + i.uv[2] as i32 - 1, lo[1] + i.uv[3] as i32 - 1];
+    // A sub-texel crop (0 < uv < 1) spans less than one texel and samples `lo` without bleeding
+    // into neighbouring atlas slots.
+    let hi = [
+        lo[0].saturating_add((i.uv[2] as i32).saturating_sub(1).max(0)),
+        lo[1].saturating_add((i.uv[3] as i32).saturating_sub(1).max(0)),
+    ];
     let base = [local[0].floor(), local[1].floor()];
     let f = [local[0] - base[0], local[1] - base[1]];
-    let t0 = [(lo[0] + base[0] as i32).clamp(lo[0], hi[0]), (lo[1] + base[1] as i32).clamp(lo[1], hi[1])];
-    let t1 = [(lo[0] + base[0] as i32 + 1).clamp(lo[0], hi[0]), (lo[1] + base[1] as i32 + 1).clamp(lo[1], hi[1])];
+    let bx = lo[0].saturating_add(base[0] as i32);
+    let by = lo[1].saturating_add(base[1] as i32);
+    let t0 = [bx.clamp(lo[0], hi[0]), by.clamp(lo[1], hi[1])];
+    let t1 = [bx.saturating_add(1).clamp(lo[0], hi[0]), by.saturating_add(1).clamp(lo[1], hi[1])];
     let pm = i.params[2] > shader_consts::FLAG_ON_THRESHOLD;
     let top = mix4(image_texel(page, t0, pm), image_texel(page, [t1[0], t0[1]], pm), f[0]);
     let bottom = mix4(image_texel(page, [t0[0], t1[1]], pm), image_texel(page, t1, pm), f[0]);
     scale4(mix4(top, bottom, f[1]), i.fill[3] * clamp01(0.5 - d))
 }
+
+#[cfg(test)]
+#[path = "shade_tests.rs"]
+mod tests;

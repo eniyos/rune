@@ -14,6 +14,9 @@ pub(super) struct GpuSide {
     pub(super) config: wgpu::SurfaceConfiguration,
     pub(super) renderer: Renderer,
     pub(super) backend: wgpu::Backend,
+    health: Rc<RefCell<(crate::machine::Seq, super::web_math::SurfaceHealth)>>,
+    retry_due: Rc<Cell<Option<crate::machine::Attempt>>>,
+    proxy: EventLoopProxy<Wake>,
 }
 
 /// A GPU device or WebGL2 context loss waiting for `Browser::lost_device` to handle.
@@ -92,7 +95,7 @@ impl Draw {
 /// `requestAdapter` or `requestDevice` then fails, blocking any WebGL2 fallback on the same
 /// canvas. wgpu's WebGPU backend does not need a surface to request an adapter or device, so
 /// the canvas surface is created only after both succeed.
-async fn try_webgpu(canvas: &web_sys::HtmlCanvasElement, features: wgpu::Features)
+pub(super) async fn try_webgpu(canvas: &web_sys::HtmlCanvasElement, features: wgpu::Features)
     -> Result<(Gpu, wgpu::Surface<'static>), String> {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::BROWSER_WEBGPU;
@@ -119,17 +122,27 @@ async fn try_webgpu(canvas: &web_sys::HtmlCanvasElement, features: wgpu::Feature
 
 /// Creates a WebGL2 surface and device on `canvas`. Unlike WebGPU, `wgpu-hal`'s WebGL2 backend
 /// discovers its adapter from the surface's `WebGL2RenderingContext`, so the surface comes first.
+/// Yields a browser macrotask between synchronous stages (`create_surface`, `request_adapter`,
+/// `request_device`) so the browser can paint and handle input between them.
 #[cfg(feature = "webgl")]
-pub(super) async fn try_webgl2(canvas: &web_sys::HtmlCanvasElement, features: wgpu::Features)
-    -> Result<(Gpu, wgpu::Surface<'static>), String> {
+pub(super) async fn try_webgl2(
+    canvas: &web_sys::HtmlCanvasElement,
+    features: wgpu::Features,
+    quitting: &std::sync::atomic::AtomicBool,
+) -> Result<(Gpu, wgpu::Surface<'static>), String> {
+    use std::sync::atomic::Ordering;
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::GL;
     let instance = wgpu::Instance::new(descriptor);
     let surface = instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone())).map_err(|e| e.to_string())?;
+    super::yield_turn().await;
+    if quitting.load(Ordering::Acquire) { return Err("app quit".into()); }
     let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::LowPower, compatible_surface: Some(&surface),
         force_fallback_adapter: false, apply_limit_buckets: false,
     }).await.map_err(|e| e.to_string())?;
+    super::yield_turn().await;
+    if quitting.load(Ordering::Acquire) { return Err("app quit".into()); }
     let adapter_limits = adapter.limits();
     let required_limits = wgpu::Limits::downlevel_webgl2_defaults()
         .using_resolution(adapter_limits.clone())
@@ -139,10 +152,20 @@ pub(super) async fn try_webgl2(canvas: &web_sys::HtmlCanvasElement, features: wg
         required_limits, experimental_features: Default::default(),
         memory_hints: Default::default(), trace: Default::default(),
     }).await.map_err(|e| format!("GPU device: {e}"))?;
+    if quitting.load(Ordering::Acquire) {
+        device.destroy();
+        return Err("app quit".into());
+    }
     Ok((Gpu::from_device(instance, adapter, device, queue), surface))
 }
 
-pub(super) async fn gpu(canvas: web_sys::HtmlCanvasElement, features: wgpu::Features) -> Result<(Gpu, wgpu::Surface<'static>), String> {
+pub(super) async fn gpu(
+    canvas: web_sys::HtmlCanvasElement,
+    features: wgpu::Features,
+    quitting: &std::sync::atomic::AtomicBool,
+) -> Result<(Gpu, wgpu::Surface<'static>), String> {
+    #[cfg(not(feature = "webgl"))]
+    let _ = quitting;
     let mut webgpu_err = None;
     for &backend in super::web_math::backend_order(health::has_navigator_gpu(), cfg!(feature = "webgl")) {
         match backend {
@@ -152,11 +175,19 @@ pub(super) async fn gpu(canvas: web_sys::HtmlCanvasElement, features: wgpu::Feat
             },
             super::web_math::WebBackend::WebGl2 => {
                 #[cfg(feature = "webgl")]
-                match try_webgl2(&canvas, features).await {
-                    Ok(pair) => return Ok(pair),
-                    Err(gl_err) => {
-                        let webgpu = webgpu_err.as_deref().unwrap_or("navigator.gpu unavailable");
-                        return Err(format!("WebGPU ({webgpu}) and WebGL2 ({gl_err}) unavailable"));
+                {
+                    if webgpu_err.is_some() {
+                        super::yield_turn().await;
+                        if quitting.load(std::sync::atomic::Ordering::Acquire) {
+                            return Err("app quit".into());
+                        }
+                    }
+                    match try_webgl2(&canvas, features, quitting).await {
+                        Ok(pair) => return Ok(pair),
+                        Err(gl_err) => {
+                            let webgpu = webgpu_err.as_deref().unwrap_or("navigator.gpu unavailable");
+                            return Err(format!("WebGPU ({webgpu}) and WebGL2 ({gl_err}) unavailable"));
+                        }
                     }
                 }
             }
@@ -175,10 +206,10 @@ pub(super) fn gpu_side(gpu: Gpu, surface: wgpu::Surface<'static>, size: (u32, u3
     };
     let backend = gpu.adapter.get_info().backend;
     let is_gl = backend == wgpu::Backend::Gl;
-    surface.configure(&gpu.device, &config);
+    let watch_proxy = proxy.clone();
     health::watch(&gpu.device, move |why| {
         *lost.borrow_mut() = Some(if is_gl { Loss::WebGl(why) } else { Loss::WebGpu(why) });
-        proxy.send_event(Wake::App).ok();
+        watch_proxy.send_event(Wake::App).ok();
     });
     let mut renderer = Renderer::new(&gpu.device, format);
     renderer.set_srgb_blend(!format.is_srgb());
@@ -186,7 +217,18 @@ pub(super) fn gpu_side(gpu: Gpu, surface: wgpu::Surface<'static>, size: (u32, u3
     // Re-upload every placed glyph row and outline record on a fresh renderer (for example after
     // a WebGL2 context restore, where a previous renderer had already cleared `atlas.dirty`).
     rt.text.atlas.invalidate();
-    Ok(GpuSide { gpu, surface, config, renderer, backend })
+    let side = GpuSide {
+        gpu,
+        surface,
+        config,
+        renderer,
+        backend,
+        health: Rc::new(RefCell::new((crate::machine::Seq::default(), super::web_math::SurfaceHealth::default()))),
+        retry_due: Rc::new(Cell::new(None)),
+        proxy,
+    };
+    configure_surface(&side);
+    Ok(side)
 }
 
 /// The canvas's configuration for `size`, and the format the renderer draws in: the canvas's,
@@ -198,7 +240,7 @@ pub(super) fn canvas_config(gpu: &Gpu, surface: &wgpu::Surface<'static>, size: (
     config.present_mode = wgpu::PresentMode::Fifo;
     let caps = surface.get_capabilities(&gpu.adapter);
     let backend = gpu.adapter.get_info().backend;
-    config.usage = super::web_math::surface_usage(caps.usages, backend, drift_wanted());
+    config.usage = super::web_math::surface_usage(caps.usages, backend);
     let chosen = super::web_math::select_surface_formats(config.format, &caps.formats, backend, srgb_blend);
     config.format = chosen.surface;
     if let Some(view) = chosen.view_format {
@@ -226,12 +268,91 @@ pub(super) fn reblend(side: &mut GpuSide, rt: &mut RuntimeCore) {
         reconfigure = true;
     }
     if reconfigure {
-        side.surface.configure(&side.gpu.device, &side.config);
+        configure_surface(side);
     }
     if side.renderer.format() != chosen.render {
         crate::window::rebuild_renderer_core(&side.gpu.device, &mut side.renderer, chosen.render, rt);
     }
     side.renderer.set_srgb_blend(chosen.srgb_blend());
+}
+
+/// Configures `side.surface` through the guarded web helper and updates `side.health` with its
+/// outcome (synchronously on WebGL2, asynchronously on WebGPU).
+pub(super) fn configure_surface(side: &GpuSide) {
+    use super::web_math::{CONFIGURE_MAX_FAILURES, SurfaceHealthEffect, SurfaceHealthEvent};
+    let attempt = {
+        let mut h = side.health.borrow_mut();
+        let (seq, state) = &mut *h;
+        let attempt = seq.next();
+        state.step(seq, SurfaceHealthEvent::Begin(attempt));
+        attempt
+    };
+    let health = side.health.clone();
+    let retry_due = side.retry_due.clone();
+    let proxy = side.proxy.clone();
+    crate::window::configure_then(&side.surface, &side.gpu, &side.config, move |res| {
+        let effects = {
+            let mut h = health.borrow_mut();
+            let (seq, state) = &mut *h;
+            state.step(seq, SurfaceHealthEvent::Outcome { attempt, error: res.err() })
+        };
+        for effect in effects {
+            match effect {
+                SurfaceHealthEffect::ReportFirst(err) => {
+                    web_sys::console::error_1(&format!("rune: web canvas surface refused configuration: {err}").into());
+                }
+                SurfaceHealthEffect::ReportGaveUp(err) => {
+                    web_sys::console::error_1(&format!(
+                        "rune: web canvas surface gave up after {CONFIGURE_MAX_FAILURES} failures, waiting for resize: {err}"
+                    ).into());
+                }
+                SurfaceHealthEffect::ScheduleRetry { attempt, delay } => {
+                    let retry_due = retry_due.clone();
+                    let proxy = proxy.clone();
+                    super::after(delay, move || {
+                        retry_due.set(Some(attempt));
+                        proxy.send_event(Wake::App).ok();
+                    });
+                }
+                SurfaceHealthEffect::Configure => {}
+            }
+        }
+    });
+}
+
+/// Runs a due configure retry if the surface is not suspended.
+pub(super) fn drain_configure_retry(side: &GpuSide, suspended: bool) {
+    if suspended { return; }
+    let Some(attempt) = side.retry_due.take() else { return };
+    let should_configure = {
+        let mut h = side.health.borrow_mut();
+        let (seq, state) = &mut *h;
+        state.step(seq, super::web_math::SurfaceHealthEvent::RetryDue(attempt))
+            .into_iter()
+            .any(|e| matches!(e, super::web_math::SurfaceHealthEffect::Configure))
+    };
+    if should_configure {
+        configure_surface(side);
+    }
+}
+
+pub(super) fn can_draw(side: &GpuSide) -> bool {
+    side.health.borrow().1.can_draw()
+}
+
+pub(super) fn on_presented(side: &GpuSide) {
+    let mut h = side.health.borrow_mut();
+    let (seq, state) = &mut *h;
+    state.step(seq, super::web_math::SurfaceHealthEvent::Presented);
+}
+
+/// Wakes a surface that was retrying or had given up so a resize can reconfigure it.
+pub(super) fn on_resized(side: &GpuSide) -> bool {
+    let was_blocked = !can_draw(side);
+    let mut h = side.health.borrow_mut();
+    let (seq, state) = &mut *h;
+    state.step(seq, super::web_math::SurfaceHealthEvent::Resized);
+    was_blocked
 }
 
 /// Acquires the next canvas texture, reconfiguring and retrying once on `Outdated`/`Lost`.
@@ -253,7 +374,10 @@ pub(super) fn acquire_texture(side: &mut GpuSide) -> Result<wgpu::SurfaceTexture
         match web_acquire_action(status, retries) {
             WebAcquireAction::UseTexture => return Ok(frame.expect("ready acquisition carries texture")),
             WebAcquireAction::ReconfigureAndRetry => {
-                side.surface.configure(&side.gpu.device, &side.config);
+                configure_surface(side);
+                if !can_draw(side) {
+                    return Err(crate::window::Missed::Occluded);
+                }
                 retries -= 1;
             }
             WebAcquireAction::Miss(missed) => return Err(missed),
@@ -306,6 +430,7 @@ pub(super) fn encode_gpu_frame(
         // Rune's default frame (a compositor that drew its own would have kept this a whole one):
         // nothing draws into the canvas but the copy of the kept frame.
         let rt = app.rt_mut();
+        side.renderer.set_fade_stops(rt.fade_stops());
         side.renderer.prepare_ui(&side.gpu.device, &side.gpu.queue, &mut rt.text.atlas, &rt.instances, prepared.size);
         side.renderer.draw_armed(&mut prepared.encoder, &prepared.frame.texture);
         false
@@ -391,10 +516,10 @@ impl Readback {
     pub(super) fn count(self, cpu: Vec<u8>) {
         let Readback { buffer, row, size: (w, h), rgba, poll_device } = self;
         let buffer = Rc::new(buffer);
-        let mapped = buffer.clone();
         let done = Rc::new(Cell::new(false));
-        let mark_done = done.clone();
+        let state = PageOnly((buffer.clone(), done.clone()));
         buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            let PageOnly((mapped, mark_done)) = &state;
             mark_done.set(true);
             if result.is_err() { return; }
             let (mut differing, mut max) = (0u32, 0u8);

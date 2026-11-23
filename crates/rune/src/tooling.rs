@@ -88,11 +88,22 @@ impl Chrome {
     /// Where macOS will draw the three buttons (x, y, w, h in points), assuming macOS 26 metrics
     /// and AppKit's default origin (7, 6) when unpositioned.
     pub fn traffic_light_rects(&self) -> Option<[[f32; 4]; 3]> {
+        self.traffic_light_rects_in(0.0, false)
+    }
+
+    /// Where macOS will draw the three buttons (x, y, w, h in points) inside a window `width`
+    /// points wide; right to left mirrors them to the right edge with Close outermost, matching
+    /// native macOS placement and [`Chrome::titlebar_inset`].
+    pub(crate) fn traffic_light_rects_in(&self, width: f32, rtl: bool) -> Option<[[f32; 4]; 3]> {
         if !self.full_size_content && self.traffic_lights.is_none() {
             return None;
         }
         let (x, y) = self.traffic_lights.unwrap_or((7.0, 6.0));
-        Some(std::array::from_fn(|i| [x + i as f32 * Self::TRAFFIC_PITCH, y, Self::TRAFFIC_LIGHT, Self::TRAFFIC_LIGHT]))
+        Some(std::array::from_fn(|i| {
+            let at = x + i as f32 * Self::TRAFFIC_PITCH;
+            let left = if rtl { width - at - Self::TRAFFIC_LIGHT } else { at };
+            [left, y, Self::TRAFFIC_LIGHT, Self::TRAFFIC_LIGHT]
+        }))
     }
 
     /// The trailing edge of [`Chrome::traffic_light_rects`]' zoom button, or 0 without them:
@@ -181,8 +192,11 @@ mod strip;
 mod trace;
 
 pub use args::{Args, is_headless};
+pub use args::{RELAUNCH_DROPS, without_relaunch_drops};
 pub(crate) use args::*;
 pub use headless::headless;
+#[cfg(not(target_arch = "wasm32"))]
+pub use perf_warn::launch::process_age;
 pub(crate) use headless::*;
 pub(crate) use key_names::{key_named, script_key_base, script_mods};
 use script::parse_script;
@@ -301,8 +315,7 @@ fn headless_window(windows: Vec<crate::AnyWindowSpec>, displays: &[crate::Displa
         return crate::window::run_windows(Box::new(move |_| vec![window]), args, options);
     }
     let scale = displays.iter().find(|d| d.primary).unwrap_or(&displays[0]).scale;
-    window.headless(args, scale as f32);
-    Ok(())
+    window.headless(args, scale as f32)
 }
 
 /// `run` with a compositor drawing every frame (see `compose`); `App::compositor` for other lifetimes.
@@ -439,6 +452,29 @@ pub(crate) fn script_input(
         | Kind::FileDialog(_) | Kind::Shortcut(_) | Kind::Resize(..) => return false,
     }
     true
+}
+
+/// Where a script event lands, in view points: a point over the view's zoom, an element's centre
+/// found when the event runs, the pointer for a wheel-like event without a point of its own, or
+/// an offset from the last press. The headless host and `--window-script` both land events here.
+pub(crate) fn script_point(rt: &RuntimeCore, e: &Ev, last_down: (f32, f32)) -> Result<(f32, f32), String> {
+    Ok(match &e.pos {
+        // A script's points are the window's; the view's are over its zoom.
+        Pos::Xy(x, y) => (*x / rt.zoom(), *y / rt.zoom()),
+        Pos::Key(key) => rt.find(key).ok_or_else(|| format!("no element with key {key:?}"))?,
+        Pos::Rel(_, _) if e.kind.at_pointer() => rt.pointer().unwrap_or((0.0, 0.0)),
+        Pos::Rel(dx, dy) => (last_down.0 + dx, last_down.1 + dy),
+    })
+}
+
+/// The `--window-script` file's events, parsed as `--script` parses its own. An unreadable or
+/// unparsable file ends the process before any window opens.
+pub(crate) fn read_window_script(args: &Args) -> Option<Vec<Ev>> {
+    args.window_script.as_ref().map(|path| {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+        let value: Value = serde_json::from_str(&text).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+        load_script(&value)
+    })
 }
 
 /// The canvas input of a script (`canvas_input.rs`) at window point (x, y); false for any

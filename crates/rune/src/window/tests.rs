@@ -113,6 +113,53 @@ fn a_frame_that_draws_the_same_pixels_is_the_same() {
     assert!(!p.same(&rt, &config), "a glyph upload draws again");
     rt.text.atlas.dirty = None;
 
+    // A GPU-filled glyph advances `rasterized` and queues a fill without marking CPU rows dirty.
+    // Select an outline-drawn mode explicitly: macOS defaults to `FontSmoothing::On` (CPU masks).
+    rt.text.set_font_smoothing(crate::FontSmoothing::WindfoilChromium);
+    rt.text.atlas.outlines.set_support(crate::text::outline::Support::Drawn);
+    let mut quads = Vec::new();
+    let rasterized_before = rt.text.atlas.rasterized();
+    rt.text.glyphs("A", crate::TextStyle::new(16.0, 400.0), 2.0, [0.0, 0.0], &mut quads);
+    assert!(rt.text.atlas.rasterized() > rasterized_before, "expected glyph rasterization");
+    assert!(rt.text.atlas.dirty.is_none(), "GPU-filled masks leave CPU rows clean");
+    assert!(!p.same(&rt, &config), "a GPU-filled glyph draws again without dirty CPU rows");
+    // Even after the renderer drains the queued fills, the presented frame predates the glyph work.
+    assert!(!rt.text.atlas.take_fills().is_empty(), "expected queued GPU fill");
+    assert!(!p.same(&rt, &config), "glyphs rasterized since the presented frame draw again even after fills drain");
+
+    // Re-record on the drained atlas, then re-queue a fill without advancing counters or dirty rows.
+    Presented::record(&mut presented, &rt, &config, false);
+    let p = presented.as_ref().unwrap();
+    assert!(p.same(&rt, &config));
+    rt.text.atlas.rows_uploaded(0, (0, crate::text::ATLAS_SIZE));
+    assert!(rt.text.atlas.dirty.is_none());
+    assert!(!p.same(&rt, &config), "queued GPU fills draw again even when counters and dirty rows match");
+    assert!(!rt.text.atlas.take_fills().is_empty());
+    assert!(p.same(&rt, &config), "draining the queued fills restores match");
+
+    // An atlas page eviction advances `resets` and clears `dirty`, without advancing `rasterized`.
+    const ICON: crate::text::Icon = crate::text::Icon {
+        name: "box",
+        view: 16.0,
+        body: r#"<rect x="1" y="1" width="14" height="14" fill="currentColor"/>"#,
+    };
+    for px in [1500, 1501, 1502] {
+        assert!(rt.text.icon_quad(&ICON, px, [0.0, 0.0]).is_some());
+    }
+    // End the burst frame (zeroing `live_texels` while keeping the overflow page), then record.
+    rt.text.begin_frame();
+    rt.text.atlas.dirty = None;
+    for page in &mut rt.text.atlas.pages { page.dirty = None; }
+    let _ = rt.text.atlas.take_fills();
+    Presented::record(&mut presented, &rt, &config, false);
+    let p = presented.as_ref().unwrap();
+    let (rasterized_before, resets_before) = (rt.text.atlas.rasterized(), rt.text.atlas.resets());
+    rt.text.begin_frame();
+    assert!(rt.text.atlas.resets() > resets_before, "expected atlas page eviction");
+    assert_eq!(rt.text.atlas.rasterized(), rasterized_before);
+    assert!(rt.text.atlas.dirty.is_none() && rt.text.atlas.pages.iter().all(|pg| pg.dirty.is_none()));
+    assert!(!p.same(&rt, &config), "an atlas reset draws again even with dirty cleared");
+
     rt.update(|n, _| *n = 8);
     rt.settle_all();
     rt.frame(0.0);
@@ -799,4 +846,68 @@ fn a_square_window_never_fades_its_corners() {
     for (i, pixel) in pixels.chunks_exact(4).enumerate() {
         assert_eq!(pixel[3], 255, "pixel {i} faded with no radius");
     }
+}
+
+/// Windows can transiently report a negative client height wrapped to `u16` (e.g. `65527` for `-9`
+/// in `WM_SIZE`) or `u32` (from `GetClientRect`). A resize exceeding `max_texture_dimension_2d` or
+/// with a zero edge keeps the previous drawable size until a valid size arrives, and initial
+/// surface creation clamps each edge to `1..=max_dim`.
+#[test]
+fn a_drawable_never_takes_a_size_exceeding_the_texture_limit() {
+    use super::surface::{CPU_MAX_SURFACE_DIM, drawable_size, max_surface_dim};
+
+    let limit = 16_384;
+    let prev = Some((1156, 777));
+
+    // Normal resizes up to the device limit pass through unchanged.
+    assert_eq!(drawable_size(prev, (1172, 777), limit), (1172, 777));
+    assert_eq!(drawable_size(prev, (limit, limit), limit), (limit, limit));
+
+    // Wrapped negative extents and zero dimensions keep the previous valid drawable.
+    assert_eq!(drawable_size(prev, (1156, 65527), limit), (1156, 777));
+    assert_eq!(drawable_size(prev, (1156, u32::MAX - 8), limit), (1156, 777));
+    assert_eq!(drawable_size(prev, (65527, 777), limit), (1156, 777));
+    assert_eq!(drawable_size(prev, (limit + 1, 777), limit), (1156, 777));
+    assert_eq!(drawable_size(prev, (1156, 0), limit), (1156, 777));
+    assert_eq!(drawable_size(prev, (0, 0), limit), (1156, 777));
+
+    // Reattaching on a device with a smaller limit clamps the fallback previous size too.
+    assert_eq!(drawable_size(Some((10_000, 600)), (1156, 65527), 8192), (8192, 600));
+
+    // Initial surface creation has no previous size: clamp into 1..=max_dim.
+    assert_eq!(drawable_size(None, (1156, 65527), limit), (1156, limit));
+    assert_eq!(drawable_size(None, (0, 0), limit), (1, 1));
+    assert_eq!(drawable_size(None, (829, 550), limit), (829, 550));
+
+    // Without a GPU attached yet (Windows CPU boot), the fallback cap still rejects wrapped u16.
+    assert_eq!(max_surface_dim(None), CPU_MAX_SURFACE_DIM);
+    assert_eq!(drawable_size(prev, (1156, 65527), max_surface_dim(None)), (1156, 777));
+}
+
+#[test]
+fn no_direct_surface_configure_outside_helper() {
+    fn walk(dir: &std::path::Path, bad: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "tests") { continue; }
+                walk(&path, bad);
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            if !name.ends_with(".rs") || name == "tests.rs" || name.ends_with("_tests.rs") { continue; }
+            let rel = path.to_string_lossy().replace('\\', "/");
+            if rel.ends_with("window/surface/configure.rs") { continue; }
+            let src = std::fs::read_to_string(&path).unwrap();
+            for (idx, line) in src.lines().enumerate() {
+                if line.contains("surface.configure(") {
+                    bad.push(format!("{rel}:{}: {}", idx + 1, line.trim()));
+                }
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut bad = Vec::new();
+    walk(&root, &mut bad);
+    assert!(bad.is_empty(), "direct surface.configure calls bypass window::configure:\n{}", bad.join("\n"));
 }

@@ -766,6 +766,7 @@ fn missed_frame_in_turn_prevents_second_step_in_same_turn() {
     let decided = frame::turn(Gate {
         prewarm: false,
         occluded: false,
+        awaiting_frame: false,
         dirty: true,
         idle: false,
         retry: None,
@@ -778,6 +779,7 @@ fn missed_frame_in_turn_prevents_second_step_in_same_turn() {
     let next = frame::turn(Gate {
         prewarm: false,
         occluded: false,
+        awaiting_frame: false,
         dirty: true,
         idle: false,
         retry: None,
@@ -948,5 +950,12 @@ fn clipboard_receive_marks_shown_overlay_dirty_without_advancing_and_advances_fr
     assert_eq!(app.rt.state.pasted, ["shown", "fading", "hidden", "occluded"]);
 }
 
+
+#[test]
+fn overlay_rescale_clamps_to_max_texture_dimension() {
+    assert_eq!(surface::overlay_rescale_size((400.0, 300.0), 2.0, 2048), (800, 600));
+    assert_eq!(surface::overlay_rescale_size((2000.0, 3000.0), 2.0, 2048), (2048, 2048));
+    assert_eq!(surface::overlay_rescale_size((0.0, -5.0), 2.0, 2048), (1, 1));
+}
 
 include!("more_tests.rs");

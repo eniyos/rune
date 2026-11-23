@@ -10,6 +10,8 @@
 
 mod baseline_store;
 mod cache;
+#[cfg(test)]
+mod fit_content_tests;
 pub mod prelude;
 mod stack;
 mod store;
@@ -21,6 +23,8 @@ mod view;
 pub use baseline_store::BaselineLayoutStore;
 pub use baseline_store::baseline_storage_stats;
 pub use cache::CompactCache;
+#[doc(hidden)]
+pub use stack::maybe_grow;
 pub use stack::stack_grow_count;
 pub use store::BoxLayout;
 pub use store::LayoutStore;

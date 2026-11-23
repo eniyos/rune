@@ -189,9 +189,10 @@ impl WindowFrame<'_> {
     fn reblend_surface(&mut self) -> bool {
         let (Some(l), Some((gpu, renderer))) = (self.host.win.as_mut(), self.host.gpu.as_mut()) else { return false };
         let Some(surface) = l.surface.as_ref() else { return false };
+        let ok = reblend_core(surface, gpu, &mut l.config, renderer, &mut l.alpha, self.host.app.rt_mut());
         #[cfg(target_os = "windows")]
-        l.native.slot.reset();
-        reblend_core(surface, gpu, &mut l.config, renderer, &mut l.alpha, self.host.app.rt_mut())
+        l.native.slot.reconfigured(ok);
+        ok
     }
 }
 
@@ -285,7 +286,10 @@ impl FrameHost for WindowFrame<'_> {
         } else { None };
         #[cfg(target_os = "macos")]
         let shown = if !hidden && l.native.prime.presumes() {
-            l.native.prime.spend();
+            // A frame drawn while AppKit still launches the app isn't counted: AppKit says
+            // nothing of the window until its own launch work is done, and the frames right
+            // after it presume as those of a window made after the launch do.
+            if !crate::platform::macos::launching() { l.native.prime.spend(); }
             if let Some(surface) = l.surface.as_ref()
                 && let Some(shown) = crate::platform::macos::PresumeShown::new(surface) {
                 Some(shown)
@@ -416,7 +420,7 @@ impl FrameHost for WindowFrame<'_> {
 
     fn on_unchanged(&mut self, _info: &StepInfo) {
         let Some(l) = self.host.win.as_mut() else { return };
-        sync_platform_core(l, self.host.app.rt_mut(), &mut self.host.secure_input, &mut self.host.ime_allowed, &self.host.clipboard);
+        sync_platform_core(l, self.host.app.rt_mut(), &mut self.host.secure_input, &mut self.host.ime, self.host.ime_waits, &self.host.clipboard);
         l.stop_pacing();
         self.host.meter.set_pacing(l.pacing_state(false));
         self.host.frame_reports.unchanged(self.state.target);
@@ -459,6 +463,8 @@ impl FrameHost for WindowFrame<'_> {
             }
             let now = *self.state.now.get_or_insert_with(crate::time::now);
             open_trace_if_needed(self.host, now);
+            // `--window-script` times its events from this, the window's first drawn frame.
+            if let Some(script) = &mut self.host.window_script { script.start(now); }
         }
         #[cfg(target_os = "macos")]
         if let Some(l) = self.host.win.as_ref() {
@@ -568,7 +574,7 @@ impl FrameHost for WindowFrame<'_> {
         if self.state.hidden { l.hidden_pace.rendered(now); }
         info.update_ms = now.elapsed().as_secs_f64() * 1000.0;
         self.state.profile.mark_built();
-        sync_platform_core(l, self.host.app.rt_mut(), &mut self.host.secure_input, &mut self.host.ime_allowed, &self.host.clipboard);
+        sync_platform_core(l, self.host.app.rt_mut(), &mut self.host.secure_input, &mut self.host.ime, self.host.ime_waits, &self.host.clipboard);
     }
 
     fn prepare_render(&mut self, drawable: wgpu::SurfaceTexture, info: &mut StepInfo) -> RenderPrep<PreparedWindowFrame> {
@@ -671,7 +677,7 @@ fn loop_step(clock: &mut FrameClock, rt: &mut RuntimeCore, at: Instant) -> Resul
 }
 
 /// The window's display refresh: its display link's on macOS, else the monitor's.
-fn display_hz(l: &Win) -> Option<f64> {
+pub(super) fn display_hz(l: &Win) -> Option<f64> {
     #[cfg(target_os = "macos")]
     if let Some(pacing) = &l.native.pacing { return Some(pacing.refresh_hz()); }
     l.window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).map(|hz| hz as f64 / 1000.0)

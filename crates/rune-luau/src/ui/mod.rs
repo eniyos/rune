@@ -72,6 +72,21 @@ pub(crate) struct Callback {
     pub(crate) script: Weak<Inner>,
 }
 
+/// A prop a node doesn't have (a typo, or one wished for: `autofocus` on a button did nothing,
+/// rune-desktop #664): an error in debug builds, so it can't pass unseen, and a warning once per
+/// script in release, where the node still draws without it.
+pub(crate) fn unknown_prop(env: &Env, node: Option<&str>, name: &str) -> Result<(), String> {
+    let message = match node {
+        Some(node) => format!("ui.{node}: unknown prop `{name}`"),
+        None => format!("unknown prop `{name}`"),
+    };
+    if cfg!(debug_assertions) {
+        return Err(message);
+    }
+    env.warn_once(format!("{message} (ignored)"));
+    Ok(())
+}
+
 /// What a render needs from its script.
 pub(crate) struct Env {
     pub(crate) script: Weak<Inner>,
@@ -187,13 +202,17 @@ pub(crate) fn attach<S: 'static>() -> &'static Attach {
 }
 
 fn press<S: 'static>(el: &mut El, cb: Rc<Callback>, key: Option<Rc<str>>, fields: Fields) {
-    el.set_on_press_tx(move |s: &mut S, tx| {
-        if let Some(script) = cb.script.upgrade() {
-            let mods = tx.mods();
-            let event = Event { fields: fields.clone(), ..Event::press(key.as_deref(), mods.shift, mods.alt, mods.cmd) };
-            script.around_write(s, Some(tx), |tx| script.handle(&cb, event, tx));
-        }
-    });
+    el.set_on_press_tx(move |s: &mut S, tx| run_press(s, tx, &cb, key.as_deref(), &fields));
+}
+
+/// Runs `cb` as a `press` of the node keyed `key`, with the modifier keys held now and `fields`
+/// added to its event.
+pub(crate) fn run_press<S: 'static>(s: &mut S, tx: &mut rune::Tx, cb: &Rc<Callback>, key: Option<&str>, fields: &Fields) {
+    if let Some(script) = cb.script.upgrade() {
+        let mods = tx.mods();
+        let event = Event { fields: fields.clone(), ..Event::press(key, mods.shift, mods.alt, mods.cmd) };
+        script.around_write(s, Some(tx), |tx| script.handle(cb, event, tx));
+    }
 }
 
 /// `onMiddlePress`: a middle click on the node (`El::on_middle_press`), as a `middle-press` event

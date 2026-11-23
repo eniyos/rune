@@ -10,6 +10,7 @@ impl RuntimeCore {
     pub(in crate::runtime) fn apply(&mut self, app: &mut dyn AppDriver, measured: Measured, tx: &Tx) {
         let _apply_time = crate::frame::profile::Scope::new(crate::frame::profile::Phase::Apply);
         let Measured { layout: mut taffy, mut nodes, reduced_motion, time_scale, defaults, titlebar, caret_read, memo_flattened, memo_reused, taken_paths, .. } = measured;
+        let rebound_press = self.rebound_press_path(&nodes);
         self.commit.defaults = defaults;
         if crate::tooling::interaction::active() { self.interaction_reused(&memo_reused); }
         let mut scratch = std::mem::take(&mut self.commit.apply_scratch);
@@ -40,6 +41,18 @@ impl RuntimeCore {
                     self.motion.grows.remove(id);
                 }
             }
+        }
+        // A path reused by a non-virtual element is no longer a virtual list; drop its stale
+        // metadata before `apply` shifts child frames or skips spans against `v.before`.
+        // Lists removed from `nodes` stay until their exiting node prunes.
+        if !self.commit.virtuals.is_empty() {
+            let Self { commit, tree, .. } = self;
+            commit.virtuals.retain(|path, _| {
+                !tree.path_ids.get(path)
+                    .and_then(|id| tree.node_index.get(id))
+                    .and_then(|&i| nodes.get(i))
+                    .is_some_and(|n| !n.virtual_list)
+            });
         }
         for v in self.commit.virtuals.values_mut() {
             v.shown = v.keys[v.range.clone()].iter().cloned().collect();
@@ -533,11 +546,13 @@ impl RuntimeCore {
         self.find_app_root();
         self.commit.commit_gen = self.commit.commit_gen.wrapping_add(1);
         let any_loop = self.prune_detached_tables(true);
-        if self.tree.nodes.len() > present_len || !self.motion.flying.is_empty() || landed || self.tree.has_sticky || self.tree.has_raise || self.tree.has_paint_order { self.update_layer_paint_order(); }
+        if self.tree.nodes.len() > present_len || !self.motion.flying.is_empty() || landed || self.tree.has_sticky || self.tree.has_raise || self.tree.has_paint_order || self.tree.has_above { self.update_layer_paint_order(); }
         else { self.paint.clear_layer_paint_order(); }
         self.tree.built = false;
         self.subscribe_live();
+        if let Some(path) = rebound_press { self.pointer.rebind_press_path(&path); }
         self.sync_modals(app);
+        self.sync_held_drag();
         self.sync_follows(app);
         self.motion.sync_loops(&self.tree.nodes, &self.scene, self.t, self.clock, self.time_scale, time_scaled, any_loop, tx.commit.lands() || self.reduced_motion);
         taffy.compact_if_sparse(|me, slot| self.tree.nodes[me as usize].taffy = slot);

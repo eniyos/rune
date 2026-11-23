@@ -103,6 +103,10 @@ pub use layout::cursor::line_edge;
 pub use layout::cursor::move_line;
 #[doc(hidden)]
 pub use layout::cursor::range_boxes;
+#[doc(hidden)]
+pub use layout::cursor::space_ahead;
+#[doc(hidden)]
+pub use layout::cursor::visual_step;
 pub use layout::decorations::Deco;
 #[doc(hidden)]
 pub use layout::decorations::PaintedDeco;
@@ -145,12 +149,18 @@ pub use layout::span::LinkPaint;
 pub use layout::span::PillChip;
 #[doc(hidden)]
 pub use layout::span::PillMetrics;
+#[doc(hidden)]
+pub use layout::span::Replace;
 pub use layout::span::Span;
 pub use layout::span::TextHighlight;
 #[doc(hidden)]
 pub use layout::span::flatten_spans;
 #[doc(hidden)]
+pub use layout::underline::line_end;
+#[doc(hidden)]
 pub use layout::underline::underline_edges;
+#[doc(hidden)]
+pub use layout::underline::underline_edges_with_end;
 pub use measure::FamiliesGuard;
 pub use measure::TextInk;
 pub use measure::advance;
@@ -225,7 +235,7 @@ use layout::cache::STALE_BYTES;
 use layout::decorations::Decoration;
 use layout::id::LayoutIds;
 use layout::rich::mono_tab_stops;
-use layout::span::PILL_BOX;
+use layout::span::{HIDDEN_SIZE, PILL_BOX, is_hidden_size};
 use layout::{cursor, hash, line_break, line_metrics, span};
 use raster::{macos, support, windfoil, windows};
 
@@ -324,7 +334,7 @@ pub struct TextSystem {
     /// Reused across lines and frames when mapping glyphs back to cluster start bytes.
     cluster_scratch: Vec<u32>,
     /// Byte ranges `(start, end, ink)` of coloured spans set by [`Self::set_glyph_inks`].
-    ink_spans: Vec<(u32, u32, u16)>,
+    ink_spans: Vec<(u32, u32, u32)>,
     coords_scratch: Vec<i16>,
     traks: Traks,
     /// The mode glyphs draw in: [`Self::requested`]'s, or its grayscale twin while subpixel
@@ -366,10 +376,16 @@ impl TextSystem {
     /// bundled sans and mono fallbacks, since there are no system fonts to discover.
     /// `families` names the sans and mono slots; others are selectable with `Family::Named`.
     pub fn new(fonts: &[&'static [u8]], families: (&str, &str)) -> Self {
+        measure::note_fonts(fonts, families);
+        Self::new_local(fonts, families)
+    }
+
+    /// Builds a [`TextSystem`] without updating the process-wide measurement state, for
+    /// [`measure::with_text`]'s thread-local measurer.
+    pub(crate) fn new_local(fonts: &[&'static [u8]], families: (&str, &str)) -> Self {
         // Windows' own word dictionaries for the scripts that need one (loaded when first asked).
         #[cfg(all(target_os = "windows", not(feature = "segmenter-dictionaries")))]
         crate::segmenter::install();
-        measure::note_fonts(fonts, families);
         let mut collection = Collection::new(CollectionOptions { shared: false, system_fonts: false });
         let list: &[&'static [u8]] = if fonts.is_empty() { DEFAULT_FONTS } else { fonts };
         let mut registered = Vec::new();
@@ -810,7 +826,7 @@ impl TextSystem {
                 }
                 e
             }
-            None => match rasterize_icon(icon, (px, size), facing, &mut self.atlas) {
+            None => match self.cached_icon(icon, px, key).unwrap_or_else(|| rasterize_icon(icon, (px, size), facing, &mut self.atlas)) {
                 Rasterized::Placed(g) => {
                     self.atlas.icons.insert(key, Some(g));
                     Some(g)

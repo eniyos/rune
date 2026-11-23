@@ -95,7 +95,7 @@ pub use el::Drag;
 pub use el::El;
 pub use el::GridRow;
 pub use el::GrowthSpec;
-pub use el::InlineIcon;
+pub use el::{InlineIcon, InlineImage};
 pub use el::LiveRegion;
 pub use el::Outline;
 pub use el::Phase;
@@ -145,6 +145,7 @@ pub use frame::profile::take_frame_phases;
 #[cfg(feature = "frame-profile")]
 #[doc(hidden)]
 pub use frame::profile::thread_cpu_ms;
+pub use frame::profile::{ThreadCpuMark, thread_cpu_mark, thread_cpu_ns, thread_cpu_since};
 pub use frame::surface_stats::Pacing;
 pub use frame::surface_stats::SurfaceCounts;
 pub use frame::surface_stats::SurfaceStats;
@@ -360,8 +361,11 @@ pub use tok::OpticalSize;
 pub use tok::TextStyle;
 pub use tooling::AppSpec;
 pub use tooling::Chrome;
+pub use tooling::RELAUNCH_DROPS;
 pub use tooling::extra_args;
 pub use tooling::is_headless;
+#[cfg(not(target_arch = "wasm32"))]
+pub use tooling::process_age;
 pub use tooling::run;
 pub use tooling::run_windows;
 pub use tooling::run_windows_with;
@@ -370,6 +374,7 @@ pub use tooling::run_with;
 pub use tooling::set_app_id;
 pub use tooling::try_run_windows_with;
 pub use tooling::try_run_windows_with_args;
+pub use tooling::without_relaunch_drops;
 pub use tracked::Reads;
 pub use tracked::Tracked;
 pub use tracked::tracked_reads;

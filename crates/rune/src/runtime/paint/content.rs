@@ -32,6 +32,8 @@ pub(in crate::runtime) struct LeafBox {
     /// window's unless it draws into a layer turned or cached first. A long text draws its
     /// lines there and no others.
     pub shown: [f32; 2],
+    /// The horizontal columns of the screen, in pixels, matching `shown`.
+    pub shown_x: [f32; 2],
 }
 
 /// `v` (device px) on the device grid inside a paint containment at `c`: the containment's
@@ -75,6 +77,7 @@ impl RuntimeCore {
             gliding,
             caret: input_caret,
             shown,
+            shown_x,
         } = b;
         let (w, h) = ((r[2] - r[0]).max(0.0), (r[3] - r[1]).max(0.0));
         let (w_exact, h_exact) = ((r_exact[2] - r_exact[0]).max(0.0), (r_exact[3] - r_exact[1]).max(0.0));
@@ -118,34 +121,31 @@ impl RuntimeCore {
                 push_shape(&mut self.instances, shape, origin, k, k_px, o, srgb, clip, fade);
             }
         }
-        if let Some(pixels) = &n.vis.pixels {
+        if w > 0.0 && h > 0.0 && let Some(pixels) = &n.vis.pixels {
             let snap_u = if cover.is_none() { (1.0 - (sc - 1.0).abs() * 32.0).clamp(0.0, 1.0) } else { 0.0 };
             let (rect, crop) = crate::pixels::fit_in(n.vis.pixels_fit, n.vis.surface_place, [r[0], r[1], w, h], pixels.size(), snap_u);
             let span = [crop[2] - crop[0], crop[3] - crop[1]];
-            // The mip covers the whole image's drawn size, not just its visible window.
-            let placed = self.images.place_at(pixels, [rect[2] / span[0], rect[3] / span[1]], Some(now));
-            // An animated image wakes the window for its next frame only while drawn in a shown
-            // window: off screen it isn't painted, so it asks for nothing.
-            if let Some((_, Some(at))) = placed && self.frame.live.visible() && self.time_scale > 0.0 {
-                let wake = self.clock + (at - now).max(0.0) / self.time_scale as f64;
-                self.paint.keep.cycles.other_deadline();
-                self.motion.arm_loop_wake(wake, at);
-            }
-            if let Some((image, _)) = placed {
-                let [x, y, iw, ih] = image.rect.map(|v| v as f32);
-                // A letterboxed image rounds its own, smaller corners.
-                let half = rect[2].min(rect[3]) * 0.5;
-                self.instances.push(Instance {
-                    rect,
-                    radii: if n.vis.pixels_fit.is_some() { radii.map(|v| v.min(half)) } else { radii },
-                    fill: [0.0, 0.0, 0.0, o],
-                    border: [0.0; 4],
-                    params: [image.page as f32, KIND_IMAGE, image.premultiplied as u8 as f32, 1.0],
-                    // The shader samples from a whole-texel origin; the span may be fractional.
-                    uv: [x + (crop[0] * iw).round(), y + (crop[1] * ih).round(), span[0] * iw, span[1] * ih],
-                    clip,
-                    fade: crate::render::pack_fade(fade, clip, clip),
-                });
+            if rect[2] > 0.0 && rect[3] > 0.0 && span[0] > 0.0 && span[1] > 0.0 {
+                // The mip covers the whole image's drawn size, not just its visible window.
+                if let Some((image, next)) = self.images.place_at(pixels, [rect[2] / span[0], rect[3] / span[1]], Some(now)) {
+                    if let Some(at) = next {
+                        arm_image_wake(&mut self.paint, &mut self.motion, self.frame.live.visible(), self.clock, self.time_scale, now, at);
+                    }
+                    let [x, y, iw, ih] = image.rect.map(|v| v as f32);
+                    // A letterboxed image rounds its own, smaller corners.
+                    let half = rect[2].min(rect[3]) * 0.5;
+                    self.instances.push(Instance {
+                        rect,
+                        radii: if n.vis.pixels_fit.is_some() { radii.map(|v| v.min(half)) } else { radii },
+                        fill: [0.0, 0.0, 0.0, o],
+                        border: [0.0; 4],
+                        params: [image.page as f32, KIND_IMAGE, image.premultiplied as u8 as f32, 1.0],
+                        // The shader samples from a whole-texel origin; the span may be fractional.
+                        uv: [x + (crop[0] * iw).round(), y + (crop[1] * ih).round(), span[0] * iw, span[1] * ih],
+                        clip,
+                        fade: crate::render::pack_fade(fade, clip, clip),
+                    });
+                }
             }
         }
         if let Some((ic, _)) = n.vis.icon {
@@ -362,6 +362,12 @@ impl RuntimeCore {
                         (crate::el::Flow::Rtl, Some(_)) => start,
                         (crate::el::Flow::Rtl, None) => start - pl_indent - text_width(pl.full_width() * tk),
                     };
+                    let pl_w = pl.full_width() * tk;
+                    let pl_clip = if inp.single_line && (pl_x + off[0] < x0 || pl_x + off[0] + pl_w > x1) {
+                        [clip[0].max(x0), clip[1], clip[2].min(x1), clip[3]]
+                    } else {
+                        clip
+                    };
                     let pl_origin = [pl_x, rest_origin[1]];
                     let pl_r_origin = if scale_motion == ScaleMotion::Still { pl_origin } else { [0.0, 0.0] };
                     self.paint.glyph_scratch.clear();
@@ -370,9 +376,18 @@ impl RuntimeCore {
                     self.text.glyphs_for_layout_scaled(&pl, pl_r_origin, raster, false, &mut self.paint.glyph_scratch);
                     self.text.set_glide([0.0; 2]);
                     let pc = premul(inp.placeholder_color, o, srgb);
+                    let zoom = tk / raster;
                     for q in &self.paint.glyph_scratch {
-                        self.instances.extend(glyph_or_image(q, &self.text, &mut self.images, pc, clip, fade)
-                            .map(|g| zoom_glyph(g, pl_origin, pl_r_origin, tk / raster)));
+                        let [gx0, gy0] = if zoom == 1.0 && pl_origin == pl_r_origin { [q.rect[0], q.rect[1]] } else {
+                            std::array::from_fn(|k| pl_origin[k] + (q.rect[k] - pl_r_origin[k]) * zoom)
+                        };
+                        if gy0 > pl_clip[3] || gy0 + q.rect[3] * zoom < pl_clip[1]
+                            || gx0 > pl_clip[2] || gx0 + q.rect[2] * zoom < pl_clip[0]
+                        {
+                            continue;
+                        }
+                        self.instances.extend(glyph_or_image(q, &self.text, &mut self.images, pc, pl_clip, fade)
+                            .map(|g| zoom_glyph(g, pl_origin, pl_r_origin, zoom)));
                     }
                 }
                 if e.focused && !departing {
@@ -553,23 +568,37 @@ impl RuntimeCore {
                     fade,
                 );
             }
+            let mut inline_image_wake: Option<f64> = None;
             for (pill, at, px) in bare_all {
                 let Some(b) = pill.bare.as_deref() else { continue };
-                let at = [
+                let mut at = [
                     base_rest[0] + (at[0] - base_d_origin[0]) * tk + glide[0],
                     base_rest[1] + (at[1] - base_d_origin[1]) * tk + glide[1],
                 ];
-                let drawn = px * tk;
-                // An image fits the square, keeping its shape; a glyph takes the text's colour.
+                let mut drawn = [px[0] * tk, px[1] * tk];
+                // A replacing image's clear margins draw past its box.
+                if let Some(bleed) = b.replace.map(|r| r.bleed * s * tk).filter(|&v| v > 0.0) {
+                    at = [at[0] - bleed, at[1] - bleed];
+                    drawn = [drawn[0] + 2.0 * bleed, drawn[1] + 2.0 * bleed];
+                }
+                // An image fits its box, keeping its shape; a glyph takes the text's colour.
                 if let Some(pixels) = &b.image
                     && let (w, h) = pixels.size()
                     && w > 0
                     && h > 0
                 {
                     let (w, h) = (w as f32, h as f32);
-                    let k = drawn / w.max(h);
-                    let rect = [at[0] + (drawn - w * k) * 0.5, at[1] + (drawn - h * k) * 0.5, w * k, h * k];
-                    if let Some(image) = self.images.place(pixels, [rect[2], rect[3]]) {
+                    let k = (drawn[0] / w).min(drawn[1] / h);
+                    let rect = [at[0] + (drawn[0] - w * k) * 0.5, at[1] + (drawn[1] - h * k) * 0.5, w * k, h * k];
+                    // An inline image outside its clip or viewport draws nothing and wakes nothing.
+                    let visible = shown_x[1] > shown_x[0] && shown[1] > shown[0]
+                        && rect[2] > 0.0 && rect[3] > 0.0
+                        && rect[0] + rect[2] > shown_x[0] && rect[0] < shown_x[1]
+                        && rect[1] + rect[3] > shown[0] && rect[1] < shown[1];
+                    if visible && let Some((image, next)) = self.images.place_at(pixels, [rect[2], rect[3]], Some(now)) {
+                        if let Some(at) = next {
+                            inline_image_wake = Some(inline_image_wake.map_or(at, |prev| prev.min(at)));
+                        }
                         self.instances.push(Instance {
                             rect,
                             radii: [(b.radius * s * tk).min(rect[2].min(rect[3]) * 0.5); 4],
@@ -584,7 +613,7 @@ impl RuntimeCore {
                     continue;
                 }
                 let Some(icon) = pill.icon else { continue };
-                let px_r = (px * raster).round().max(1.0) as u32;
+                let px_r = (px[0] * raster).round().max(1.0) as u32;
                 paint_inline_icon(
                     &mut self.text,
                     &mut self.paint,
@@ -596,7 +625,7 @@ impl RuntimeCore {
                     n.id,
                     icon,
                     px_r,
-                    drawn,
+                    drawn[0],
                     at,
                     pill.fg.unwrap_or(color),
                     o,
@@ -781,6 +810,9 @@ impl RuntimeCore {
             if let (Some(c), Some(inp)) = (caret, &n.input) {
                 self.instances.push(rect_inst(c, premul(inp.caret, o, srgb), 0.0, clip, fade));
             }
+            if let Some(at) = inline_image_wake {
+                arm_image_wake(&mut self.paint, &mut self.motion, self.frame.live.visible(), self.clock, self.time_scale, now, at);
+            }
             self.text.set_emit(crate::text::outline::Emit::Atlas);
         }
     }
@@ -836,7 +868,7 @@ impl RuntimeCore {
             let mut widths = fade;
             let mut origins = fade_origin;
             if spec.truncate_fade && overflows {
-                let width = (spec.style.size * spec.fade_em * sc * s).min((bounds[2] - bounds[0]).max(0.0));
+                let width = (spec.style.size * spec.fade_em * sc * s).min((bounds[2] - bounds[0]).max(0.0)).clamp(0.0, 65504.0);
                 // The fade is where the text is cut: the end of its own paragraph, which runs out
                 // past the box on that side. An Arabic title in a left-to-right row fades on the
                 // left and keeps its first words whole; a Latin one in a right-to-left row on the
@@ -853,6 +885,23 @@ impl RuntimeCore {
                 }
             }
         }
+    }
+}
+
+/// Wakes a shown window for an animated image's next frame at animation time `at`.
+fn arm_image_wake(
+    paint: &mut state::PaintState,
+    motion: &mut crate::runtime::tracks::MotionState,
+    live_visible: bool,
+    clock: f64,
+    time_scale: f32,
+    now: f64,
+    at: f64,
+) {
+    if live_visible && time_scale > 0.0 {
+        let wake = clock + (at - now).max(0.0) / time_scale as f64;
+        paint.keep.cycles.other_deadline();
+        motion.arm_loop_wake(wake, at);
     }
 }
 

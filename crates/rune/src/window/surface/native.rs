@@ -31,11 +31,14 @@ pub(in crate::window) struct Native {
     pub(in crate::window) launch_drawables: super::LaunchDrawables,
     /// Forgets the window's traffic-light spot.
     pub(in crate::window) _spot: crate::platform::macos::traffic_lights::Spot,
+    /// Forgets the window's drag-destination state.
+    pub(in crate::window) _drop: Option<crate::platform::macos::drop::DropTarget>,
 }
 
 /// Whether a frame may presume the window on screen before AppKit says so: `Host::try_create`'s
-/// frame and one follow-up do, since the window reaches the screen with that turn's Core
-/// Animation commit. Once AppKit answers, or the window leaves the screen, none does.
+/// frame, a panel ordered in (`Win::show`), and one follow-up do, since the window reaches the
+/// screen with that turn's Core Animation commit. Once AppKit answers, or the window leaves the
+/// screen, none does.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::window) enum Prime {
@@ -46,6 +49,9 @@ pub(in crate::window) enum Prime {
 #[cfg(target_os = "macos")]
 impl Prime {
     pub(in crate::window) fn launching() -> Self { Prime::Launching { left: 2 } }
+
+    /// Presumes the window shown for the next two frames (used when ordering a panel in).
+    pub(in crate::window) fn arm(&mut self) { *self = Self::launching(); }
 
     pub(in crate::window) fn presumes(self) -> bool { matches!(self, Prime::Launching { .. }) }
 
@@ -88,6 +94,8 @@ pub(in crate::window) struct Native {
     pub(in crate::window) a11y_start: A11yStart,
     /// Playing clips shown on their own layer under the UI (`video_layer`).
     pub(in crate::window) video_layers: crate::window::win32::video_layer::VideoLayers,
+    /// Revokes the window's OLE drop target and prunes its registry entry when the window goes.
+    pub(in crate::window) drop_target: Option<crate::platform::win32::drop_target::DropTarget>,
 }
 
 /// When a window's UI Automation adapter is made: with the window (a screen reader is running),

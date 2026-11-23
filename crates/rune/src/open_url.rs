@@ -54,6 +54,10 @@ pub(crate) fn check(url: &str) -> Result<String, OpenUrlError> { check_link(url,
 /// is relative to the page, and the browser resolves it.
 pub(crate) fn check_same_tab(url: &str) -> Result<String, OpenUrlError> { check_link(url, cfg!(target_arch = "wasm32")) }
 
+/// `check` for a web `<a href>` (the accessibility mirror and `--html` export): `http:`,
+/// `https:`, `mailto:`, or a relative path/query/fragment that isn't scheme-relative (`//`).
+pub(crate) fn check_href(url: &str) -> Result<String, OpenUrlError> { check_link(url, true) }
+
 fn check_link(url: &str, relative: bool) -> Result<String, OpenUrlError> {
     let url = url.trim();
     if url.is_empty() { return Err(OpenUrlError::Empty); }
@@ -64,7 +68,7 @@ fn check_link(url: &str, relative: bool) -> Result<String, OpenUrlError> {
     {
         return Err(OpenUrlError::Invalid);
     }
-    if relative && url.find([':', '/', '?', '#']).is_none_or(|i| url.as_bytes()[i] != b':') {
+    if relative && !url.starts_with("//") && url.find([':', '/', '?', '#']).is_none_or(|i| url.as_bytes()[i] != b':') {
         return Ok(url.to_owned());
     }
     let (scheme, rest) = url.split_once(':').ok_or(OpenUrlError::Invalid)?;
@@ -256,14 +260,80 @@ mod tests {
 
     #[test]
     fn same_tab_links_may_be_relative_only_on_web() {
-        for relative in ["/notes/42", "notes/42?x=1", "?q=a", "#top", "../c", "a/b:c"] {
+        for relative in ["/", "/notes/42", "/notes//42", "notes/42?x=1", "?q=a", "?//x", "#top", "#//x", "./a", "../c", "a/b:c"] {
             assert_eq!(check_link(relative, true).as_deref(), Ok(relative), "{relative:?}");
             assert_eq!(check_link(relative, false), Err(OpenUrlError::Invalid), "{relative:?}");
         }
+        assert_eq!(check_link("  /notes/42 ", true).as_deref(), Ok("/notes/42"));
+        assert_eq!(check_link("  /notes/42 ", false), Err(OpenUrlError::Invalid));
         assert_eq!(check_link("javascript:alert(1)", true), Err(OpenUrlError::UnsupportedScheme("javascript".into())));
         assert_eq!(check_link("/a b", true), Err(OpenUrlError::Invalid));
         assert_eq!(check_link("HTTPS://example.com/x", true).as_deref(), Ok("https://example.com/x"));
         assert_eq!(check_same_tab("/notes/42"), Err(OpenUrlError::Invalid), "native has no page to resolve against");
+    }
+
+    #[test]
+    fn scheme_relative_and_authority_like_links_are_refused() {
+        for bad in [
+            "//evil.example/x", "//evil.example", "//evil.example:8080/x",
+            "//user@evil.example/x", "//evil.example?q=1#top", "//https://evil.example/x",
+            "//", "///evil.example/x", "////evil.example/x",
+            "  //evil.example/x  ", "\t//evil.example/x", "\n//evil.example/x",
+            "\r//evil.example/x", "\u{00a0}//evil.example/x",
+            "\x00//evil.example/x", "\x01//evil.example/x", "\x1f//evil.example/x",
+            "\x7f//evil.example/x", " \x01//evil.example/x",
+            "/\t/evil.example/x", "/\n/evil.example/x", "/\r/evil.example/x",
+            "/ /evil.example/x", "/\x00/evil.example/x",
+            "\\\\evil.example/x", "/\\evil.example/x", "\\/evil.example/x",
+            "\\evil.example/x", "  /\\evil.example/x", "  \\\\evil.example/x",
+            "///\\evil.example/x",
+        ] {
+            assert_eq!(check_link(bad, true), Err(OpenUrlError::Invalid), "web: {bad:?}");
+            assert_eq!(check_link(bad, false), Err(OpenUrlError::Invalid), "native: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn check_href_blocks_unsafe_schemes_and_allows_web_and_relative_links() {
+        for (raw, want) in [
+            ("http://example.com/a?b=1#c", "http://example.com/a?b=1#c"),
+            ("HTTP://example.com/a", "http://example.com/a"),
+            ("https://example.com/docs?a=1&b=2", "https://example.com/docs?a=1&b=2"),
+            ("  HTTPS://example.com/docs  ", "https://example.com/docs"),
+            ("mailto:someone@example.com?subject=Hi", "mailto:someone@example.com?subject=Hi"),
+            ("MAILTO:someone@example.com", "mailto:someone@example.com"),
+            ("/", "/"),
+            ("/docs", "/docs"),
+            ("  /notes/42 ", "/notes/42"),
+            ("notes/42?x=1", "notes/42?x=1"),
+            ("?q=a", "?q=a"),
+            ("#install", "#install"),
+            ("./a", "./a"),
+            ("../c", "../c"),
+            ("a/b:c", "a/b:c"),
+        ] {
+            assert_eq!(check_href(raw).as_deref(), Ok(want), "{raw:?}");
+        }
+        for bad in [
+            "", "   ",
+            "javascript:alert(1)", "JAVASCRIPT:alert(1)", "JaVaScRiPt:void(0)",
+            "javascript://%0aalert(1)",
+            "  javascript:alert(1)  ", "\tjavascript:alert(1)", "\njavascript:alert(1)",
+            "\rjavascript:alert(1)", "\x0cjavascript:alert(1)", "\u{00a0}javascript:alert(1)",
+            "\x00javascript:alert(1)", "\x01javascript:alert(1)", "\x1fjavascript:alert(1)",
+            "\x7fjavascript:alert(1)", " \x01javascript:alert(1)",
+            "java\tscript:alert(1)", "java\nscript:alert(1)", "java\rscript:alert(1)",
+            "java\x00script:alert(1)",
+            "data:text/html,<script>alert(1)</script>", "data:text/html;base64,PHNjcmlwdD4=",
+            "DATA:text/plain,hi", "  DaTa:text/plain,hi",
+            "vbscript:msgbox(1)", "VbScript:msgbox(1)", " \tVBSCRIPT:msgbox(1)",
+            "file:///etc/passwd", "blob:https://example.com/1",
+            "//evil.example/x", "///evil.example/x", "  //evil.example/x",
+            "/\\evil.example/x", "\\\\evil.example/x",
+            "\x00https://example.com", "\x01/docs", "/docs\x00",
+        ] {
+            assert!(check_href(bad).is_err(), "must refuse {bad:?}");
+        }
     }
 
     #[test]

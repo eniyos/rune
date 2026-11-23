@@ -116,13 +116,13 @@ impl ModalScope {
         // leaves them to the pointer and assistive technology, as the native ones are.
         let caption = |n: &Node| n.key.as_deref() == Some(crate::titlebar::BUTTONS_KEY)
             && n.parent.is_some_and(|p| nodes[p].key.as_deref() == Some(crate::titlebar::FRAME_KEY));
-        let mut members: Vec<bool> = nodes.iter().enumerate().map(|(i, n)| i >= index || caption(n)).collect();
+        let mut members: Vec<bool> = nodes.iter().enumerate().map(|(i, n)| i == index || caption(n)).collect();
         // Portals are root siblings. Follow their anchor ownership, including chained
         // popovers, rather than requiring their layout parent to be the modal.
         loop {
             let mut changed = false;
             for (i, n) in nodes.iter().enumerate() {
-                if members[i] || is_exiting(i) { continue; }
+                if members[i] || is_exiting(i) || is_unmounted(i) { continue; }
                 let parent_inside = n.parent.is_some_and(|p| members[p]);
                 let anchor_inside = n.above.as_ref().is_some_and(|a| nodes.iter().enumerate()
                     .any(|(j, anchor)| anchor.key.as_deref() == Some(&a.key) && members[j]));
@@ -140,10 +140,10 @@ impl focus_machine::KeyboardState {
         self.modal_scope.as_ref().map(|m| m.index)
     }
 
-    /// Node `i` (its subtree ending before `end`) holds the open modal.
+    /// Node `i` (its subtree ending before `end`) holds an open modal member.
     #[inline]
     pub(in crate::runtime) fn modal_ancestor(&self, i: usize, end: usize) -> bool {
-        self.modal_scope.as_ref().is_some_and(|m| m.index > i && m.index < end)
+        self.modal_scope.as_ref().is_some_and(|m| m.members.get(i + 1..end).is_some_and(|s| s.iter().any(|&b| b)))
     }
 
     /// Node `i` is inside the open modal's scope, or no modal is open.
@@ -216,7 +216,7 @@ impl RuntimeCore {
     pub(crate) fn active_modal(&self) -> Option<usize> {
         self.kbd.active_modal()
     }
-    /// Node `i` (its subtree ending before `end`) holds the open modal.
+    /// Node `i` (its subtree ending before `end`) holds an open modal member.
     #[inline]
     pub(crate) fn modal_ancestor(&self, i: usize, end: usize) -> bool {
         self.kbd.modal_ancestor(i, end)
@@ -397,10 +397,10 @@ impl RuntimeCore {
             .unwrap_or(crate::el::Outline { width: 3.0, offset: 0.0, color: self.host.system_accent.focus(self.env.system_dark) })
     }
     pub(crate) fn set_focus(&mut self, app: &mut dyn AppDriver, path: Option<String>, keyboard: bool) -> bool {
-        self.set_focus_entry(app, path, keyboard, false)
+        self.set_focus_entry(app, path, keyboard, false, false)
     }
-    fn set_focus_entry(&mut self, app: &mut dyn AppDriver, path: Option<String>, keyboard: bool, keep_entry: bool) -> bool {
-        self.edit.input_click.on_focus_change(path.as_deref());
+    fn set_focus_entry(&mut self, app: &mut dyn AppDriver, path: Option<String>, keyboard: bool, keep_entry: bool, sync_all: bool) -> bool {
+        self.edit.on_input_focus_change(path.as_deref());
         let moved = self.kbd.focus.path() != path.as_deref();
         // A field left mid-composition keeps what it showed, as a browser's does (Tab the input
         // method let through, a click on another control, `Tx::focus`).
@@ -419,13 +419,30 @@ impl RuntimeCore {
             self.clear_text_selection();
         }
         let mut changed = moved && self.physical_focus_lost(app);
+        let prev = self.kbd.focus.path();
+        let next = path.as_deref();
+        let needs_sync = |p: &str, input: &crate::el::InputSpec, focused: bool| {
+            prev == Some(p)
+                || next == Some(p)
+                || (sync_all
+                    && (input.edit.focused != focused
+                        || (!focused && input.edit.is_composing())
+                        || input.edit.is_secure()
+                        || input.revealed_override.is_some()))
+        };
         for n in &mut self.tree.nodes {
             if let Some(input) = &mut n.input {
-                changed |= sync_input_focus(input, app.states(), path.as_deref() == Some(n.path.as_str()));
+                let focused = next == Some(n.path.as_str());
+                if needs_sync(n.path.as_str(), input, focused) {
+                    changed |= sync_input_focus(input, app.states(), focused);
+                }
             }
         }
         for (p, input) in &mut self.commit.virtual_inputs {
-            changed |= sync_input_focus(input, app.states(), path.as_deref() == Some(p.as_str()));
+            let focused = next == Some(p.as_str());
+            if needs_sync(p.as_str(), input, focused) {
+                changed |= sync_input_focus(input, app.states(), focused);
+            }
         }
         let shown = (self.kbd.focus.keyboard(), self.kbd.focus.shown());
         for effect in self.kbd.focus.step(focus_machine::FocusEvent::Set { path, keyboard, keep_entry }) {
@@ -455,14 +472,30 @@ impl RuntimeCore {
         // A `Tx::focus_when_shown` still owed stands until the user's own input or another ask,
         // whatever focus did meanwhile (a closing palette leaves it nowhere, then on the prompt).
         let owed = self.kbd.focus_owed.take().map(|(key, ring)| (key, ring, crate::el::FocusAsk::WhenShown));
-        let asked = self.kbd.focus_request.take().or(owed);
+        let request = self.kbd.focus_request.take();
+        let blurred = matches!(request, Some(focus_machine::FocusRequest::Blur));
+        let asked = match request {
+            Some(focus_machine::FocusRequest::Focus(key, ring, ask)) => Some((key, ring, ask)),
+            Some(focus_machine::FocusRequest::Blur) | None => owed,
+        };
+        if blurred { self.kbd.focus_before_commit = None; }
         let waits = asked.as_ref().filter(|(.., ask)| *ask == crate::el::FocusAsk::WhenShown).map(|(key, ring, _)| (key.clone(), *ring));
         self.kbd.record_unmounted_focused(&self.tree.nodes, nodes, &self.commit.virtual_inputs);
         let within = |path: &str, root: &str| {
             path == root || (path.len() > root.len() && path.starts_with(root) && path.as_bytes()[root.len()] == b'/')
         };
         let shown = |idx: usize| node_shown(nodes, idx);
-        let restore = self.tree.nodes.iter().enumerate().rev().find_map(|(i, old)| {
+        let first_link = |j: usize| {
+            (nodes[j].input.is_none() && links::link_count(&nodes[j]) > 0).then_some(0)
+        };
+        let link_target = |key: &str| {
+            (0..nodes.len()).find_map(|j| {
+                if !shown(j) || nodes[j].input.is_some() || !self.can_take_focus(&nodes[j]) { return None; }
+                let k = nodes[j].text.as_ref()?.cold.links.iter().position(|l| l.id == key)?;
+                Some((j, k))
+            })
+        };
+        let restore = (!blurred).then(|| self.tree.nodes.iter().enumerate().rev().find_map(|(i, old)| {
             let key = old.focus.return_to.as_deref()?;
             if self.subtree_exiting(i) || nodes.iter().any(|n| n.path == old.path) { return None; }
             let focused = self.kbd.focus.now_or_blurred()?;
@@ -479,19 +512,27 @@ impl RuntimeCore {
                 old.path.as_str()
             };
             if !within(focused, scope) { return None; }
-            let anchor = nodes.iter().find(|n| n.key.as_deref() == Some(key))?;
-            let candidates = (0..nodes.len()).filter(|&j| within(&nodes[j].path, &anchor.path) && shown(j)
-                && self.can_take_focus(&nodes[j]));
-            candidates.clone().find(|&j| nodes[j].focus.selected)
-                .or_else(|| candidates.into_iter().next())
-                .map(|j| nodes[j].path.clone())
-        });
-        // `Tx::focus`: the first shown element with the key, or its first focusable child.
+            let by_key = nodes.iter().find(|n| n.key.as_deref() == Some(key)).and_then(|anchor| {
+                let candidates = (0..nodes.len()).filter(|&j| within(&nodes[j].path, &anchor.path) && shown(j)
+                    && self.can_take_focus(&nodes[j]));
+                candidates.clone().find(|&j| nodes[j].focus.selected)
+                    .or_else(|| candidates.into_iter().next())
+                    .map(|j| (j, first_link(j)))
+            });
+            let (j, link) = by_key.or_else(|| link_target(key).map(|(j, k)| (j, Some(k))))?;
+            Some((nodes[j].path.clone(), link))
+        })).flatten();
+        // `Tx::focus`: the first shown element with the key, or its first focusable child,
+        // else a shown text's `Link` with that id.
         let asked = asked.and_then(|(key, ring, ask)| {
-            let anchor = (0..nodes.len()).find(|&j| nodes[j].key.as_deref() == Some(key.as_str()) && shown(j))?;
-            (anchor..nodes.len()).take_while(|&j| within(&nodes[j].path, &nodes[anchor].path))
-                .find(|&j| shown(j) && self.can_take_focus(&nodes[j]))
-                .map(|j| (nodes[j].path.clone(), ring, ask))
+            let by_key = (0..nodes.len()).find(|&j| nodes[j].key.as_deref() == Some(key.as_str()) && shown(j))
+                .and_then(|anchor| {
+                    (anchor..nodes.len()).take_while(|&j| within(&nodes[j].path, &nodes[anchor].path))
+                        .find(|&j| shown(j) && self.can_take_focus(&nodes[j]))
+                        .map(|j| (j, first_link(j)))
+                });
+            let (j, link) = by_key.or_else(|| link_target(key.as_str()).map(|(j, k)| (j, Some(k))))?;
+            Some((nodes[j].path.clone(), link, ring, ask))
         });
         let input_focused = self.kbd.focus.path().is_some_and(|p| {
             nodes.iter().any(|n| n.path == p && !n.inert && n.input.as_ref().is_some_and(|i| i.edit.focused))
@@ -519,27 +560,46 @@ impl RuntimeCore {
             .or_else(|| virtual_req().filter(|&(p, edit)| newly_requested(p, edit)).min_by_key(|&(p, _)| p))
             .map(|(p, _)| p.to_owned())
             .or_else(|| asked.as_ref().map(|(p, ..)| p.clone()))
-            .or(restore)
-            .or_else(|| self.kbd.focus.owned().filter(|p| (0..nodes.len()).any(|j| &nodes[j].path == p && shown(j)
+            .or_else(|| restore.as_ref().map(|(p, _)| p.clone()))
+            .or_else(|| (!blurred).then(|| self.kbd.focus.owned().filter(|p| (0..nodes.len()).any(|j| &nodes[j].path == p && shown(j)
                 && (self.takes_focus(&nodes[j]) || nodes[j].input.as_ref().is_some_and(|i| i.edit.focused)))
-                || self.commit.virtual_inputs.get(p).is_some_and(|i| i.edit.focused)))
-            .or_else(|| requested.into_iter().next().or_else(|| virtual_req().min_by_key(|&(p, _)| p)).map(|(p, _)| p.to_owned()))
-            .or_else(|| self.focus_fallback(nodes));
+                || self.commit.virtual_inputs.get(p).is_some_and(|i| i.edit.focused))).flatten())
+            .or_else(|| (!blurred).then(|| requested.into_iter().next().or_else(|| virtual_req().min_by_key(|&(p, _)| p)).map(|(p, _)| p.to_owned())).flatten())
+            .or_else(|| (!blurred).then(|| self.focus_fallback(nodes)).flatten());
         // State may have deleted a row. Only the new view's accessors are valid now.
         // Use the same focus path as input events, then restore the old presentation
         // tree so apply can retain its exit visuals.
         let explicit = asked.as_ref().filter(|(p, ..)| next.as_deref() == Some(p.as_str()));
+        let restored = explicit.is_none().then(|| restore.as_ref().filter(|(p, _)| next.as_deref() == Some(p.as_str()))).flatten();
+        let target_link = explicit.map(|(_, link, ..)| *link).or_else(|| restored.map(|(_, link)| *link));
         let keep_entry = explicit.is_none() && next.as_deref() == self.kbd.focus.path();
-        let keyboard = explicit.map_or_else(|| self.kbd.focus.keyboard(), |(_, ring, _)| *ring);
-        self.kbd.set_focus_returned(matches!(explicit, Some((_, _, crate::el::FocusAsk::Return))));
+        let keyboard = explicit.map_or_else(|| self.kbd.focus.keyboard(), |(_, _, ring, _)| *ring);
+        self.kbd.set_focus_returned(matches!(explicit, Some((_, _, _, crate::el::FocusAsk::Return))));
         if asked.is_none() && let Some(owed) = waits { self.kbd.focus_owed = Some(owed); }
         std::mem::swap(&mut self.tree.nodes, nodes);
         self.nodes_replaced();
-        let changed = self.set_focus_entry(app, next, keyboard, keep_entry);
+        let changed = self.set_focus_entry(app, next, keyboard, keep_entry, true);
+        if let Some(link) = target_link {
+            match link {
+                Some(k) => self.edit.set_link_focus(k),
+                None => self.edit.blur_links(),
+            }
+        } else if let Some(i) = self.focused_index()
+            && self.tree.nodes[i].input.is_none()
+            && !self.edit.link_focused(&self.tree.nodes[i])
+        {
+            self.edit.enter_links(&self.tree.nodes[i], false);
+        }
         std::mem::swap(&mut self.tree.nodes, nodes);
         self.nodes_replaced();
+        if blurred && self.kbd.focus.path().is_none() {
+            // An explicit blur is not the temporary pointer-down blur of a scrim, and nothing
+            // hands focus on from it: only a control the user blurred and then left does.
+            self.kbd.focus.step(focus_machine::FocusEvent::Dropped);
+            self.kbd.focus.step(focus_machine::FocusEvent::Settled);
+        }
         if self.edit.input_click.dragging_path().is_some_and(|p| !nodes.iter().any(|n| n.path == p && !n.inert && n.input.is_some())) {
-            self.edit.input_click.drop_drag();
+            self.edit.drop_input_drag();
         }
         if !self.pointer.press.is_held() {
             self.kbd.focus.step(focus_machine::FocusEvent::Settled);
@@ -588,7 +648,7 @@ impl RuntimeCore {
         // as OpenCode Desktop's focus rescue does (opencode#64909); focus never falls to the window.
         if nodes.iter().any(|n| n.path == gone && self.can_take_focus(n)) { return None; }
         if self.kbd.focus.path().is_none() && self.tree.nodes[at].input.is_none() { return None; }
-        if self.active_modal().is_some_and(|m| at >= m && self.modal_member(at)) { return None; }
+        if self.active_modal().is_some() && self.modal_member(at) { return None; }
         let new: rustc_hash::FxHashMap<&str, usize> = nodes.iter().enumerate().map(|(j, n)| (n.path.as_str(), j)).collect();
         // Building the new tree hands an old node's path and id to the node that replaces it and
         // leaves it without a path, so a control still here can look absent. Resolve those by id.
@@ -759,12 +819,15 @@ impl RuntimeCore {
         // Past Tab, a Shift-modified key navigates and presses nothing: it goes on to the app.
         // Typed text still type-selects (Shift-A is "A").
         if ev.mods.shift && !matches!(&ev.key, Key::Text(t) if !t.trim().is_empty()) { return false; }
-        // A slider's keys come before its group's arrows.
+        // A slider's keys come before its group's arrows. On a text field (a spin button),
+        // Left and Right stay with the caret.
         if let Some(step) = self.tree.nodes[i].focus.step.clone() {
             // A right-to-left slider runs from its right: Left raises it.
             let rtl = self.tree.nodes[i].flow == crate::el::Flow::Rtl;
+            let field = self.tree.nodes[i].input.is_some();
             let delta = match ev.key {
-                Key::Left => Some(if rtl { 1 } else { -1 }), Key::Right => Some(if rtl { -1 } else { 1 }),
+                Key::Left if !field => Some(if rtl { 1 } else { -1 }),
+                Key::Right if !field => Some(if rtl { -1 } else { 1 }),
                 Key::Down => Some(-1), Key::Up => Some(1),
                 Key::PageDown => Some(-10), Key::PageUp => Some(10),
                 _ => None,

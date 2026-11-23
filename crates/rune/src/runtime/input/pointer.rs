@@ -16,18 +16,22 @@ impl RuntimeCore {
         self.pointer.pos = Some((x, y));
         self.autoscroll_moved(x, y);
         if self.in_viewport(x, y) { self.pointer.set_left(false); }
-        for &(id, rect) in self.hit.hits() {
-            if self.hit_contains(id, rect, x, y)
-                && let Some(&i) = self.tree.node_index.get(&id)
-                && self.tree.nodes[i].handlers.get().is_some_and(|h| h.on_pointer_move.is_some())
-            {
-                let point = self.pointer_event(i, x, y);
-                self.frame.queue.push(Action::PointerMove(self.tree.nodes[i].path.clone(), point));
+        if let Some(top) = self.top_hit(x, y) {
+            for &(id, rect) in self.hit.hits() {
+                if self.hit_contains(id, rect, x, y)
+                    && let Some(&i) = self.tree.node_index.get(&id)
+                    && self.allowed(i)
+                    && self.tree.nodes[i].handlers.get().is_some_and(|h| h.on_pointer_move.is_some())
+                    && self.node_holds(i, top)
+                {
+                    let point = self.pointer_event(i, x, y);
+                    self.frame.queue.push(Action::PointerMove(self.tree.nodes[i].path.clone(), point));
+                }
             }
         }
         self.refresh_hover(x, y);
         let Some(held) = self.pointer.press.held() else { return };
-        let (path, d, at, button) = (held.path.clone(), held.drag, held.at, held.button);
+        let (path, d, at, button, is_drag) = (held.path.clone(), held.drag, held.at, held.button, held.drag_handler.is_some());
         if held.drag_out.is_some_and(|threshold| crate::drag_out::past_threshold(at, (x, y), threshold)) && self.start_drag_out(app, path.clone()) {
             return;
         }
@@ -41,7 +45,7 @@ impl RuntimeCore {
             return;
         }
         let Some(i) = self.live_index(&path) else { return };
-        let (id, r, has_drag) = (self.tree.nodes[i].id, self.tree.nodes[i].target, self.drags_with(i, button));
+        let (id, r, has_drag) = (self.tree.nodes[i].id, self.tree.nodes[i].target, is_drag && self.drags_with(i, button));
         // A hit rect is where the element was drawn (after scrolling); `target` is its
         // unscrolled layout rect, kept only for elements that were never drawn. Only the
         // pointer moving decides whether it's still inside: a button that springs out from
@@ -64,19 +68,28 @@ impl RuntimeCore {
         }
     }
 
-    /// Overlay observation updates coordinates without presenting unchanged hover pixels.
+    /// Updates pointer coordinates and hover/drag state, returning true only when the move
+    /// changed something the next frame must run or paint (queued handlers or drags, hover,
+    /// hover-group or press tracks, hovered links, tooltips, text selection drags, OS drag-out,
+    /// or a newly armed autoscroll or edge-scroll step).
     pub(crate) fn observe_pointer(&mut self, app: &dyn ViewDriver, x: f32, y: f32) -> bool {
         if self.pointer.pos == Some((x, y)) { return false; }
-        let visual_changed = self.tree.nodes.iter().enumerate().any(|(i, n)| {
-            if n.vis.hover().a <= 0.0 && !n.vis.tracks_press() && n.handlers.get().is_none_or(|h| h.press_scale.is_none()) { return false; }
-            let inside = |p: Option<(f32, f32)>| p.is_some_and(|(x, y)| self.node_contains(i, x, y));
-            inside(self.pointer.pos) != inside(Some((x, y)))
-        });
-        // Reaching or leaving a help element starts or ends its tooltip's wait.
-        let help_changed = self.help_target_changes(x, y);
-        let (queued, capture_inside) = (self.frame.queue.len(), self.pointer.press_inside());
+        let queued = self.frame.queue.len();
+        let capture_inside = self.pointer.press_inside();
+        let prev_link = self.hovered_link();
+        let prev_sel = self.selection_drag_snapshot();
+        let prev_edge = self.edit.selectable.edge.running();
+        let prev_autoscroll = self.pointer.autoscroll_armed();
         self.pointer_move(app, x, y);
-        visual_changed || help_changed || self.frame.queue.len() != queued || self.pointer.press_inside() != capture_inside
+        self.frame.queue.len() != queued
+            || self.pointer.press_inside() != capture_inside
+            || self.pointer.drag_out_request.is_some()
+            || self.hovered_link() != prev_link
+            || self.selection_drag_snapshot() != prev_sel
+            || (!prev_edge && self.edit.selectable.edge.running())
+            || (!prev_autoscroll && self.pointer.autoscroll_armed())
+            || self.interaction_changes()
+            || self.help_changes()
     }
 
     /// A button holds the pointer: the OS keeps sending its moves to this window, and a leave
@@ -109,7 +122,7 @@ impl RuntimeCore {
         self.pointer.autoscroll_cancel();
         self.cancel_drag();
         self.drop_drag_out_request();
-        self.edit.input_click.clear();
+        self.edit.clear_input_click();
         self.drop_press();
         self.pointer.clear_secondary();
         self.pointer.clear_tint();
@@ -139,18 +152,67 @@ impl RuntimeCore {
     fn cancel_drag_at(&mut self, point: Option<(f32, f32)>) -> bool {
         if self.edit.input_click.captured() { return false; }
         let Some(held) = self.pointer.press.held() else { return false };
-        let Some(i) = self.live_index(&held.path) else { return false };
-        if !self.drags_with(i, held.button) { return false; }
+        let Some(fallback) = held.drag_handler.clone() else { return false };
+        let live = self.node_index(&held.path).filter(|&i| self.drags_with(i, held.button));
+        let handler = live.and_then(|i| self.tree.nodes[i].handlers.on_drag.clone()).unwrap_or(fallback);
         let at = held.at;
         let (x, y) = point.unwrap_or(at);
-        let [lx, ly] = self.to_local(i, x, y);
         let (dx, dy) = (x - at.0, y - at.1);
+        let [lx, ly] = match live {
+            Some(i) if self.tree.built || self.tree.built_ids.get(i) == Some(&self.tree.nodes[i].id) => self.to_local(i, x, y),
+            _ => [held.drag.start_x + dx, held.drag.start_y + dy],
+        };
         let screen = self.screen_at(x, y);
         let Some(held) = self.drop_press() else { return false };
         let d = Drag { phase: Phase::Up, x: lx, y: ly, dx, dy, cancelled: true, window: [x, y], screen, ..held.drag };
+        self.pointer.push_drag_gone(held.path.clone(), handler);
         self.frame.queue.push(Action::Drag(held.path, d, held.button));
         self.pointer.end_press_repeat();
         true
+    }
+
+    /// Before `apply` mutates `self.scene` and replaces `self.tree.nodes`: if the held press's
+    /// path left `nodes` only because a sibling shifted an unkeyed ancestor's index, returns its
+    /// unique new path so the press follows the element across the commit.
+    pub(in crate::runtime) fn rebound_press_path(&self, nodes: &[Node]) -> Option<String> {
+        let held = self.pointer.press.held()?;
+        if nodes.iter().any(|n| n.path == held.path) { return None; }
+        let (is_drag, button) = (held.drag_handler.is_some(), held.button);
+        let matches = |n: &Node| {
+            selectable::same_keyed_path(&held.path, &n.path)
+                && (!is_drag || (n.handlers.on_drag.is_some() && !self.drags_out(n)
+                    && (button == crate::PointerButton::Primary
+                        || n.handlers.gestures.as_ref().is_some_and(|g| g.buttons & button.bit() != 0))))
+        };
+        let mut found = nodes.iter().filter(|n| matches(n));
+        let next = found.next()?;
+        if found.next().is_some() { return None; }
+        // Do not steal another element that was already live at `next.path` before this commit.
+        let already_live = self.tree.nodes.iter().enumerate()
+            .find(|(_, o)| o.id == next.id)
+            .is_some_and(|(oi, _)| !self.subtree_exiting(oi) && !self.subtree_unmounted(oi));
+        (!already_live).then(|| next.path.clone())
+    }
+
+    /// After a commit: a held drag whose element left the tree, started exiting, turned inert
+    /// or stopped dragging ends with a cancelled `Phase::Up`; one that stayed live refreshes
+    /// its fallback handler from the new view.
+    pub(in crate::runtime) fn sync_held_drag(&mut self) {
+        let Some((path, button)) = self.pointer.press.held()
+            .filter(|h| h.drag_handler.is_some())
+            .map(|h| (h.path.clone(), h.button))
+        else { return };
+        if let Some(i) = self.node_index(&path)
+            && self.allowed(i)
+            && self.drags_with(i, button)
+        {
+            let fresh = self.tree.nodes[i].handlers.on_drag.clone();
+            if let Some(held) = self.pointer.press.held_mut() {
+                held.drag_handler = fresh;
+            }
+            return;
+        }
+        self.cancel_drag();
     }
 
     /// The button is up, so the held press can no longer start a drag-out; it stays a press.
@@ -226,7 +288,7 @@ impl RuntimeCore {
         self.pointer.hover_paused = true;
         let target = self.primary_target(x, y);
         if target.and_then(|t| self.textbox_input(t)).is_none() {
-            self.edit.input_click.clear();
+            self.edit.clear_input_click();
         }
         if let Some(i) = self.active_modal()
             && target.is_none_or(|t| !self.allowed(t))
@@ -268,19 +330,20 @@ impl RuntimeCore {
             first.path == n.path && press_run::follows(first.at, first.point, now, (x, y), self.double_click_interval)
         });
         if let Some(ji) = self.textbox_input(ti) {
-            self.input_down(ji, x, y, now, second);
+            self.input_down(ji, x, y, now, second, link.filter(|_| ji == ti));
             return;
         }
         // Clicking a link leaves focus where it is (a composer keeps typing). Selectable text
         // off its links isn't a control: the press blurs, as a click on plain content does.
         // Inside a control that owns its keyboard (`El::on_key`), a click on any part of it
         // focuses it, as a click on a table view's row focuses the table.
-        // A `Cx::web_focus` control that keeps the field's focus on a press (`preserve_focus_on_press`)
-        // doesn't take it, as a button whose mousedown is prevented.
         // So does a click on plain content in a focusable scroll region, as a web page focuses a
         // `tabIndex` scroller (a `ScrollView`) clicked where nothing inside takes focus; and a
         // press on a layer that hands focus below it (`El::press_focuses_below`) focuses the one
         // under the pointer.
+        // A control that keeps the field's focus on a press (`preserve_focus_on_press`) doesn't
+        // take focus on click, and a click on its unfocusable descendants doesn't focus an
+        // `on_key` or scroll ancestor either (explicitly focusable descendants still take focus).
         if n.focus.below && !on_link {
             match self.scroll_region_below(ti, x, y) {
                 Some(r) => self.frame.queue.push(Action::FocusControl(self.tree.nodes[r].path.clone())),
@@ -288,12 +351,12 @@ impl RuntimeCore {
                 None => {}
             }
         }
-        let takes_focus = n.focus.enabled || (self.takes_focus(n) && !self.press_keeps_focus(ti));
-        let keyed = (!takes_focus && !self.is_selectable(ti)).then(|| std::iter::successors(n.parent, |&p| self.tree.nodes[p].parent)
+        let (preserve_focus, keeps) = (self.press_keeps_focus(ti), self.press_keeps_selection(ti));
+        let takes_focus = (n.focus.enabled && !n.focus.preserve_on_press.focus) || (self.takes_focus(n) && !preserve_focus);
+        let keyed = (!takes_focus && !self.is_selectable(ti) && !preserve_focus).then(|| std::iter::successors(n.parent, |&p| self.tree.nodes[p].parent)
             .take_while(|&p| self.allowed(p))
             .find(|&p| (self.tree.nodes[p].focus.key.is_some() || self.focuses_on_click(p)) && self.can_focus(p))).flatten();
         let in_textbox = std::iter::successors(n.parent, |&p| self.tree.nodes[p].parent).any(|p| self.textbox_input(p).is_some());
-        let (preserve_focus, keeps) = (self.press_keeps_focus(ti), self.press_keeps_selection(ti));
         let below = n.focus.below;
         if !below && !on_link && !keeps && takes_focus && !self.is_selectable(ti) {
             self.frame.queue.push(Action::FocusControl(n.path.clone()));
@@ -324,14 +387,15 @@ impl RuntimeCore {
         };
         let path = n.path.clone();
         let drag_out = self.drags_out(n).then(|| n.handlers.drag_threshold.unwrap_or(crate::drag_out::DRAG_THRESHOLD));
-        if n.handlers.on_drag.is_some() && drag_out.is_none() {
+        let drag_handler = drag_out.is_none().then(|| n.handlers.on_drag.clone()).flatten();
+        if drag_handler.is_some() {
             self.frame.queue.push(Action::Drag(path.clone(), d, crate::PointerButton::Primary));
         }
         let on_down = !touch && n.handlers.press_on_down && n.handlers.on_press.is_some();
         if on_down {
             self.frame.queue.push(Action::Press(path.clone(), crate::PointerButton::Primary, false));
         }
-        let mut held = capture::Held::new(path, d, crate::PointerButton::Primary, (x, y), now, second, drag_out).on_link(link).pressed_on_down(on_down);
+        let mut held = capture::Held::new(path, d, crate::PointerButton::Primary, (x, y), now, second, drag_out).on_link(link).pressed_on_down(on_down).drag_handler(drag_handler);
         held.touch = touch;
         self.pointer.press.hold(held);
     }
@@ -366,6 +430,7 @@ impl RuntimeCore {
     /// What input has queued for handlers, emptied: each drag event, `None` for a press.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn take_queued_pointer(&mut self) -> Vec<Option<Drag>> {
+        self.pointer.clear_drag_gone();
         let heard = self.frame.queue.iter().filter_map(|action| match action {
             Action::Drag(_, drag, _) => Some(Some(*drag)),
             Action::Press(..) => Some(None),
@@ -396,6 +461,7 @@ impl RuntimeCore {
         // A drag that selected text is a selection, not a press.
         let selected = self.selected_by_drag();
         self.select_step(selectable::phase::Event::Release);
+        let input_following = self.edit.input_click.dragging_path().is_some();
         let input_capture = self.edit.input_click.end_press();
         self.pointer.end_press_repeat();
         let now = self.now_clock();
@@ -408,16 +474,26 @@ impl RuntimeCore {
             .then(|| capture::FirstClick { path: h.path.clone(), at: h.down_at, point: h.at });
         let Some(held) = self.pointer.press.release(first) else { return };
         let inside = held.inside();
-        let capture::Held { path, drag: d, button, at, down_at, moved, second: double, link, pressed_on_down, .. } = *held;
+        let capture::Held { path, drag: d, button, at, down_at, moved, second: double, link, pressed_on_down, drag_handler, .. } = *held;
         self.refresh_hover_within();
         if moved { self.pointer.clear_press_clicks(); }
-        if input_capture { return; }
+        if input_capture {
+            if input_following
+                && inside
+                && !moved
+                && let Some(k) = link
+                && self.live_index(&path).is_some_and(|i| !self.input_drag_selects(i, at, (x, y)))
+            {
+                self.link_up(&path, k, x, y, button);
+            }
+            return;
+        }
         let Some(i) = self.live_index(&path) else { return };
         let n = &self.tree.nodes[i];
         // A button the element didn't opt in to is the middle button's click on a link or on
         // `on_middle_press`: neither its `on_press` nor its `on_drag` hears it.
         let opted = self.takes_button(i, button);
-        let (has_drag, has_press, has_double) = (self.drags_with(i, button), opted && n.handlers.on_press.is_some(), n.handlers.on_double_press.is_some());
+        let (has_drag, has_press, has_double) = (drag_handler.is_some() && self.drags_with(i, button), opted && n.handlers.on_press.is_some(), n.handlers.on_double_press.is_some());
         let middle_press = !opted && link.is_none() && n.handlers.on_middle_press.is_some();
         if has_drag {
             let (dx, dy) = (x - at.0, y - at.1);
@@ -425,7 +501,7 @@ impl RuntimeCore {
             self.frame.queue.push(Action::Drag(path.clone(), Drag { phase: Phase::Up, x: lx, y: ly, dx, dy, window: [x, y], screen: self.screen_at(x, y), ..d }, button));
         }
         if let Some(k) = link.filter(|_| inside) { self.link_up(&path, k, x, y, button); }
-        if has_press && inside && !selected && !pressed_on_down {
+        if has_press && inside && !selected && !pressed_on_down && !(has_drag && moved) {
             self.frame.queue.push(Action::Press(path.clone(), button, held.touch));
         }
         if middle_press && inside {
@@ -469,18 +545,24 @@ impl RuntimeCore {
         let Some((x, y)) = self.pointer.pos.filter(|&(x, y)| self.in_viewport(x, y)) else { return crate::el::Cursor::Default };
         if let Some(pan) = self.autoscroll_cursor() { return pan; }
         // An element on its way out has no cursor: `Cursor::Hidden` ends when it's removed.
-        // Selectable text shows its I-beam even where its presses go to a row around it.
+        // Selectable text and hoverable hit targets keep their own cursor inside a pressable or
+        // draggable ancestor.
         let target = match self.pointer.press.path() {
             Some(_) if self.edit.selectable.phase.dragging() => self.selection_holder(),
             Some(p) => self.live_index(p).filter(|&i| self.allowed(i)),
             // Moving layout holds hover: the cursor stays with what the pointer was over.
-            None => self.held_hover().flatten().or_else(|| self.selectable_at(x, y).or_else(|| self.primary_target(x, y))),
+            None => self.held_hover().flatten().or_else(|| self.cursor_target(x, y)),
         };
         let Some(mut i) = target else {
             return crate::el::Cursor::Default;
         };
         if self.tree.nodes[i].handlers.cursor.is_none() && (self.tree.nodes[i].input.is_some() || self.tree.nodes[i].role == "textbox") {
-            return crate::el::Cursor::Text;
+            let input_link = self.tree.nodes[i].input.is_some()
+                && self.tree.nodes[i].text.as_ref().is_some_and(|t| t.cold.on_link.is_some())
+                && (!self.edit.input_click.captured()
+                    || self.pointer.press.held().is_some_and(|h| !h.moved && h.link.is_some()))
+                && self.link_at(i, x, y).is_some();
+            return if input_link { crate::el::Cursor::Pointer } else { crate::el::Cursor::Text };
         }
         if self.is_selectable(i) && !self.edit.selectable.phase.dragging() && self.link_at(i, x, y).is_some() {
             return crate::el::Cursor::Pointer;
